@@ -38,6 +38,16 @@ class AppConfig:
     buffered_mode: bool = False
     palm_only: bool = False
     palm_region_only: bool = False
+    # Performance and behavior
+    max_fps: Optional[float] = 30.0
+    process_every: int = 1
+    display: bool = True
+    camera_buffer_size: Optional[int] = None
+    cv2_threads: Optional[int] = None
+    # Detector tuning (mediapipe)
+    mp_max_hands: int = 2
+    mp_det_conf: float = 0.5
+    mp_track_conf: float = 0.5
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -59,13 +69,22 @@ def parse_args() -> AppConfig:
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     parser.add_argument("--palm-only", action="store_true", help="Filter to open palm detections only (heuristic)")
     parser.add_argument("--palm-region-only", action="store_true", help="Draw and return only the palm region (no fingers)")
+    parser.add_argument("--max-fps", type=float, default=30.0, help="Limit processing FPS (e.g., 15, 30). Use 0 or negative for unlimited")
+    parser.add_argument("--process-every", type=int, default=1, help="Process every Nth frame when not registering (1=every)")
+    parser.add_argument("--mp-max-hands", type=int, default=2, help="Maximum number of hands to detect (mediapipe)")
+    parser.add_argument("--mp-det-conf", type=float, default=0.5, help="Minimum detection confidence (mediapipe)")
+    parser.add_argument("--mp-track-conf", type=float, default=0.5, help="Minimum tracking confidence (mediapipe)")
+    parser.add_argument("--camera-buffer-size", type=int, default=None, help="Hint buffer size for camera capture (backend-dependent)")
+    parser.add_argument("--cv2-threads", type=int, default=None, help="Set OpenCV thread count (e.g., 1 to reduce CPU)")
     try:
         bool_action = argparse.BooleanOptionalAction  # Python 3.9+
         parser.add_argument("--immediate-forwarding", action=bool_action, default=True, help="ESP32 streams directly for detection (placeholder)")
         parser.add_argument("--buffered-mode", action=bool_action, default=False, help="ESP32 buffered SD card mode (placeholder)")
+        parser.add_argument("--display", action=bool_action, default=True, help="Show window and accept hotkeys")
     except Exception:
         parser.add_argument("--immediate-forwarding", action="store_true", default=True, help="ESP32 streams directly for detection (placeholder)")
         parser.add_argument("--buffered-mode", action="store_true", default=False, help="ESP32 buffered SD card mode (placeholder)")
+        parser.add_argument("--display", action="store_true", default=True, help="Show window and accept hotkeys")
     args = parser.parse_args()
 
     # Convert source to int if numeric
@@ -77,6 +96,15 @@ def parse_args() -> AppConfig:
 
     setup_logging(args.log_level)
 
+    # Normalize and clamp values
+    max_fps: Optional[float]
+    if args.max_fps is None or args.max_fps <= 0:
+        max_fps = None
+    else:
+        max_fps = float(args.max_fps)
+
+    process_every = max(1, int(args.process_every))
+
     return AppConfig(
         backend=args.backend,
         source=source,
@@ -86,6 +114,14 @@ def parse_args() -> AppConfig:
         buffered_mode=getattr(args, "buffered_mode", False),
         palm_only=bool(args.palm_only),
         palm_region_only=bool(args.palm_region_only),
+        max_fps=max_fps,
+        process_every=process_every,
+        display=getattr(args, "display", True),
+        camera_buffer_size=args.camera_buffer_size,
+        cv2_threads=args.cv2_threads,
+        mp_max_hands=int(args.mp_max_hands),
+        mp_det_conf=float(args.mp_det_conf),
+        mp_track_conf=float(args.mp_track_conf),
     )
 
 
@@ -99,21 +135,37 @@ def main() -> None:
     if config.immediate_forwarding:
         logger.info("Immediate forwarding enabled (placeholder). Using local capture.")
 
-    cap = VideoCapture(source=config.source, width=config.width, height=config.height)
+    # OpenCV runtime tuning
+    try:
+        cv2.setUseOptimized(True)
+        if config.cv2_threads is not None and config.cv2_threads > 0:
+            cv2.setNumThreads(int(config.cv2_threads))
+    except Exception:
+        pass
+
+    cap = VideoCapture(source=config.source, width=config.width, height=config.height, buffer_size=config.camera_buffer_size)
     try:
         cap.open()
     except Exception as exc:
         logger.error("Could not open video source: %s", exc)
         return
 
-    detector = PalmDetector(backend=config.backend, palm_only=config.palm_only, palm_region_only=config.palm_region_only)
+    detector = PalmDetector(
+        backend=config.backend,
+        palm_only=config.palm_only,
+        palm_region_only=config.palm_region_only,
+        max_num_hands=config.mp_max_hands,
+        detection_confidence=config.mp_det_conf,
+        tracking_confidence=config.mp_track_conf,
+    )
 
     window_name = "Palm Detection"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    try:
-        cv2.resizeWindow(window_name, 1280, 960)
-    except Exception:
-        pass
+    if config.display:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        try:
+            cv2.resizeWindow(window_name, 1280, 960)
+        except Exception:
+            pass
 
     # Registration state
     registering: bool = False
@@ -154,15 +206,23 @@ def main() -> None:
     try:
         initial_help_printed: bool = False
         window_sized: bool = False
+        frame_index: int = 0
         while True:
+            frame_start = time.perf_counter()
+            frame_index += 1
             ret, frame = cap.read()
             if not ret or frame is None:
                 logger.warning("No frame received from source.")
                 break
 
-            annotated, detections = detector.detect(frame)
+            # Process stride: when not registering, process every Nth frame to save CPU
+            should_process = True if registering else (config.process_every <= 1 or (frame_index % config.process_every == 0))
+            if should_process:
+                annotated, detections = detector.detect(frame)
+            else:
+                annotated, detections = frame, []
             # After first frame, set window to the camera's native size without downscaling
-            if not window_sized:
+            if config.display and not window_sized:
                 try:
                     h0, w0 = annotated.shape[:2]
                     # Let OpenCV auto-size the window to the image; then ensure size is at least native
@@ -323,11 +383,15 @@ def main() -> None:
                     last_capture_flash_at = None
 
             # Avoid per-frame terminal printing to prevent flooding
-            cv2.imshow(window_name, annotated)
-            if not initial_help_printed:
-                print_line([status_text, "Keys: r=register  c=cancel  q=quit"])
-                initial_help_printed = True
-            key = cv2.waitKey(1) & 0xFF
+            if config.display:
+                cv2.imshow(window_name, annotated)
+                if not initial_help_printed:
+                    print_line([status_text, "Keys: r=register  c=cancel  q=quit"])
+                    initial_help_printed = True
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                key = 0
+
             if key == ord("q"):
                 logger.info("Quit requested by user.")
                 break
@@ -366,6 +430,17 @@ def main() -> None:
                 print_line([status_text, "Keys: r=register  q=quit"])
                 last_announced_step_index = -1
                 next_guide_ready_at = None
+
+            # FPS limiter
+            if config.max_fps is not None and config.max_fps > 0:
+                target_dt = 1.0 / max(1e-6, config.max_fps)
+                elapsed = time.perf_counter() - frame_start
+                remaining = target_dt - elapsed
+                if remaining > 0:
+                    try:
+                        time.sleep(remaining)
+                    except Exception:
+                        pass
     finally:
         try:
             sys.stdout.write("\n")
@@ -374,7 +449,8 @@ def main() -> None:
             pass
         detector.close()
         cap.release()
-        cv2.destroyAllWindows()
+        if config.display:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

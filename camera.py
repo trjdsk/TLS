@@ -26,10 +26,11 @@ class VideoCapture:
         height: Optional desired frame height.
     """
 
-    def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, height: Optional[int] = None) -> None:
+    def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, height: Optional[int] = None, buffer_size: Optional[int] = None) -> None:
         self.source: Union[int, str] = source
         self.width: Optional[int] = width
         self.height: Optional[int] = height
+        self.buffer_size: Optional[int] = buffer_size
         self._cap: Optional[cv2.VideoCapture] = None
 
     def open(self) -> None:
@@ -44,6 +45,13 @@ class VideoCapture:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
         if self.height is not None:
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+
+        # Apply optional buffer size (best-effort; backend-dependent)
+        if self.buffer_size is not None:
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, float(self.buffer_size))
+            except Exception:
+                logger.debug("CAP_PROP_BUFFERSIZE not supported by backend")
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         """Read a frame from the video source.

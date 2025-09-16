@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, List, Literal, Optional, Tuple
 
 import numpy as np
+import cv2  # avoid repeated per-call imports
 
 try:
     import mediapipe as mp  # type: ignore
@@ -120,7 +121,6 @@ class _MediaPipeHandDetector:
         # Landmarks that approximate palm base: wrist + MCP/CMC joints
         indices = [0, 1, 2, 5, 9, 13, 17]
         pts = landmarks_xy[indices]
-        import cv2
         hull = cv2.convexHull(pts.reshape(-1, 1, 2)).reshape(-1, 2)
         return hull.astype(int)
 
@@ -156,7 +156,6 @@ class _MediaPipeHandDetector:
                     except Exception:
                         score = None
 
-                import cv2
                 if self._palm_region_only:
                     # Compute palm polygon and bbox
                     palm_poly = self._palm_polygon(coords_np)
