@@ -13,9 +13,19 @@ from typing import Optional, Union
 
 import cv2
 import numpy as np
+import time
+import sys
 
 from camera import VideoCapture
 from detector import PalmDetector
+from registration import (
+    Snapshot,
+    crop_roi,
+    extract_embedding,
+    palm_bbox_from_landmarks,
+    register_user,
+    validate_consistency,
+)
 
 
 @dataclass
@@ -100,8 +110,50 @@ def main() -> None:
 
     window_name = "Palm Detection"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    try:
+        cv2.resizeWindow(window_name, 1280, 960)
+    except Exception:
+        pass
+
+    # Registration state
+    registering: bool = False
+    user_id: Optional[str] = None
+    snapshots: list[Snapshot] = []
+    total_targets: int = 10
+    max_frames_to_try: int = 300  # allow more time; counts only when no detections
+    frames_tried: int = 0
+    waiting_for_movement: bool = False  # ensure one snapshot per guidance step
+    last_bbox: Optional[tuple[int, int, int, int]] = None
+    step_ready_at: Optional[float] = None  # 2s buffer before each snapshot
+    status_text: str = "Press 'r' to Register Palm. Press 'q' to quit."
+    last_capture_flash_at: Optional[float] = None
+    last_announced_step_index: int = -1
+    next_guide_ready_at: Optional[float] = None  # announce next guidance after this time
+
+    guidance_msgs = [
+        "Hold steady…",
+        "Rotate slightly to the left…",
+        "Rotate slightly to the right…",
+        "Move hand a bit closer…",
+        "Move hand a bit further…",
+        "Tilt palm up a bit…",
+        "Tilt palm down a bit…",
+        "Shift slightly left…",
+        "Shift slightly right…",
+        "Return to neutral position…",
+    ]
+
+    def print_line(lines: list[str]) -> None:
+        try:
+            s = " | ".join(lines)
+            sys.stdout.write(s + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     try:
+        initial_help_printed: bool = False
+        window_sized: bool = False
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
@@ -109,18 +161,217 @@ def main() -> None:
                 break
 
             annotated, detections = detector.detect(frame)
+            # After first frame, set window to the camera's native size without downscaling
+            if not window_sized:
+                try:
+                    h0, w0 = annotated.shape[:2]
+                    # Let OpenCV auto-size the window to the image; then ensure size is at least native
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE, 1)
+                    cv2.resizeWindow(window_name, int(w0), int(h0))
+                except Exception:
+                    pass
+                window_sized = True
 
-            if len(detections) > 0:
-                logger.info("Palm detected (%d hands)", len(detections))
+            if registering:
+                # Registration flow: capture up to total_targets validated snapshots
+                current_count = len(snapshots)
+                guide = guidance_msgs[min(current_count, len(guidance_msgs) - 1)]
+                if not waiting_for_movement:
+                    base_status = f"Registering '{user_id}': Capture {current_count+1}/{total_targets} — {guide}"
+                else:
+                    base_status = f"Adjust palm for next angle — {guide}"
+                # Print the guidance for this step once when we enter a new capture step
+                if not waiting_for_movement and last_announced_step_index != current_count:
+                    print_line([f"Step {current_count+1}/{total_targets}: {guide}"])
+                    last_announced_step_index = current_count
+                if len(detections) > 0:
+                    frames_tried = 0  # reset miss counter when a palm is visible
+                    # Use the largest bbox if multiple detections
+                    det = max(detections, key=lambda d: (d.bbox[2] * d.bbox[3]))
+                    # Prefer palm-only bbox if landmarks available
+                    bbox = palm_bbox_from_landmarks(det.landmarks) if det.landmarks is not None else det.bbox
+                    # Compute change metrics if we're waiting for movement
+                    if waiting_for_movement and last_bbox is not None:
+                        lx, ly, lw, lh = last_bbox
+                        cx_prev = lx + lw / 2.0
+                        cy_prev = ly + lh / 2.0
+                        bx, by, bw, bh = bbox
+                        cx_curr = bx + bw / 2.0
+                        cy_curr = by + bh / 2.0
+                        centroid_shift = float(np.hypot(cx_curr - cx_prev, cy_curr - cy_prev))
+                        area_prev = max(1.0, float(lw * lh))
+                        area_curr = max(1.0, float(bw * bh))
+                        scale_change = abs(area_curr - area_prev) / area_prev
+                        # IoU for overlap
+                        inter_x1 = max(lx, bx)
+                        inter_y1 = max(ly, by)
+                        inter_x2 = min(lx + lw, bx + bw)
+                        inter_y2 = min(ly + lh, by + bh)
+                        inter_w = max(0, inter_x2 - inter_x1)
+                        inter_h = max(0, inter_y2 - inter_y1)
+                        inter_area = inter_w * inter_h
+                        union = lw * lh + bw * bh - inter_area
+                        iou = float(inter_area / union) if union > 0 else 0.0
+                        # Consider movement sufficient if overlap reduced or centroid/scale changed enough
+                        moved_enough = (iou < 0.75) or (centroid_shift > 25.0) or (scale_change > 0.15)
+                        if moved_enough:
+                            waiting_for_movement = False
+                            frames_tried = 0
+                            step_ready_at = None  # will start buffer when new pose is detected
+                            # Announce next step guidance immediately
+                            next_idx = len(snapshots)
+                            if last_announced_step_index != next_idx:
+                                next_guide = guidance_msgs[min(next_idx, len(guidance_msgs) - 1)]
+                                print_line([f"Step {next_idx+1}/{total_targets}: {next_guide}"])
+                                last_announced_step_index = next_idx
+                    # Take a single snapshot only if not waiting_for_movement
+                    if not waiting_for_movement:
+                        now = time.time()
+                        if step_ready_at is None:
+                            step_ready_at = now + 3.0
+                        # Show countdown in status
+                        remaining = max(0.0, step_ready_at - now)
+                        status_text = f"{base_status} | Hold steady {remaining:.1f}s"
+                        if now >= step_ready_at:
+                            roi = crop_roi(frame, bbox, pad=8)
+                            if roi.size > 0 and roi.shape[0] >= 16 and roi.shape[1] >= 16:
+                                emb = extract_embedding(roi)
+                                snapshots.append(Snapshot(roi_bgr=roi, bbox_xywh=bbox, landmarks_xy=det.landmarks, embedding=emb))
+                                last_bbox = bbox
+                                waiting_for_movement = True  # require movement before next snapshot
+                                frames_tried = 0  # reset tries on success to allow more time for next movement
+                                step_ready_at = None
+                                last_capture_flash_at = now
+                                print_line([f"Captured snapshot {len(snapshots)}/{total_targets} for '{user_id}'."])
+                                # Schedule next guidance announcement in 1 second
+                                next_guide_ready_at = now + 1.0
+                else:
+                    # No detections; reset buffer timer while registering
+                    if registering:
+                        step_ready_at = None
+                    status_text = base_status
+                    frames_tried += 1  # count only when palm not detected
+
+                # If still waiting for movement, announce the next step guidance after 1 second regardless of movement
+                if waiting_for_movement and next_guide_ready_at is not None:
+                    now2 = time.time()
+                    if now2 >= next_guide_ready_at:
+                        next_idx = len(snapshots)
+                        if last_announced_step_index != next_idx:
+                            next_guide = guidance_msgs[min(next_idx, len(guidance_msgs) - 1)]
+                            print_line([f"Step {next_idx+1}/{total_targets}: {next_guide}"])
+                            last_announced_step_index = next_idx
+                        next_guide_ready_at = None
+
+                # Check stopping conditions
+                if len(snapshots) >= total_targets:
+                    # Validate consistency: ensure they are of the same palm with slight movement
+                    bboxes = [s.bbox_xywh for s in snapshots]
+                    consistent = validate_consistency(bboxes, min_iou=0.10)
+                    valid_embeddings = [s.embedding for s in snapshots if s.embedding is not None]
+
+                    valid_embeddings_np = [e for e in valid_embeddings if isinstance(e, np.ndarray) and e.size > 0]
+                    if consistent and len(valid_embeddings_np) >= 7:
+                        ok = register_user(user_id or "unknown", valid_embeddings_np)
+                        if ok:
+                            status_text = "Registration successful. Press 'r' to register another, 'q' to quit."
+                        else:
+                            status_text = "Registration failed — duplicate user ID or DB error."
+                    else:
+                        if not consistent:
+                            status_text = "Registration failed — inconsistent detections (move too much or different palm)."
+                        else:
+                            status_text = "Registration failed — insufficient valid snapshots."
+                    # Reset state regardless
+                    registering = False
+                    user_id = None
+                    snapshots.clear()
+                    frames_tried = 0
+                    waiting_for_movement = False
+                    last_bbox = None
+                    step_ready_at = None
+                    print_line([status_text, "Keys: r=register  q=quit"])
+                    last_announced_step_index = -1
+                    next_guide_ready_at = None
+                elif frames_tried >= max_frames_to_try:
+                    # Too many misses; cancel (no debug folder creation)
+                    status_text = "Registration cancelled — palm not visible often enough."
+                    registering = False
+                    user_id = None
+                    snapshots.clear()
+                    frames_tried = 0
+                    waiting_for_movement = False
+                    last_bbox = None
+                    step_ready_at = None
+                    print_line([status_text, "Keys: r=register  q=quit"])
+                    last_announced_step_index = -1
+                    next_guide_ready_at = None
             else:
-                logger.debug("No palm detected")
+                if len(detections) > 0:
+                    logger.debug("Palm detected (%d)", len(detections))
+                else:
+                    logger.debug("No palm detected")
 
+            # Visual indicators (no text): yellow border during countdown, green flash after capture
+            if registering:
+                now_vis = time.time()
+                if step_ready_at is not None:
+                    cv2.rectangle(annotated, (2, 2), (annotated.shape[1]-3, annotated.shape[0]-3), (0, 255, 255), 2)
+                if last_capture_flash_at is not None and (now_vis - last_capture_flash_at) < 0.3:
+                    cv2.rectangle(annotated, (2, 2), (annotated.shape[1]-3, annotated.shape[0]-3), (0, 255, 0), 2)
+                elif last_capture_flash_at is not None and (now_vis - last_capture_flash_at) >= 0.3:
+                    last_capture_flash_at = None
+
+            # Avoid per-frame terminal printing to prevent flooding
             cv2.imshow(window_name, annotated)
+            if not initial_help_printed:
+                print_line([status_text, "Keys: r=register  c=cancel  q=quit"])
+                initial_help_printed = True
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 logger.info("Quit requested by user.")
                 break
+            if key == ord("r") and not registering:
+                # Auto-generate a random 16-char user_id with symbols
+                try:
+                    import secrets
+                    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.@#$"
+                    generated = "".join(secrets.choice(alphabet) for _ in range(16))
+                except Exception:
+                    # Fallback if secrets not available
+                    import random
+                    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.@#$"
+                    generated = "".join(random.choice(alphabet) for _ in range(16))
+
+                registering = True
+                user_id = generated
+                snapshots.clear()
+                frames_tried = 0
+                waiting_for_movement = False
+                last_bbox = None
+                step_ready_at = None
+                status_text = f"Starting registration for '{user_id}'. Show your palm."
+                print_line([status_text, f"Snapshots: {len(snapshots)}/{total_targets}"])
+                last_announced_step_index = -1
+                next_guide_ready_at = None
+            if key == ord("c") and registering:
+                registering = False
+                user_id = None
+                snapshots.clear()
+                frames_tried = 0
+                waiting_for_movement = False
+                last_bbox = None
+                step_ready_at = None
+                status_text = "Registration cancelled by user."
+                print_line([status_text, "Keys: r=register  q=quit"])
+                last_announced_step_index = -1
+                next_guide_ready_at = None
     finally:
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
         detector.close()
         cap.release()
         cv2.destroyAllWindows()

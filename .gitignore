@@ -1,3 +1,25 @@
+# SQLite database files
+palms.db
+*.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Palm registration artifacts and database
+palms.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
 # Virtual environments
 .venv/
 
