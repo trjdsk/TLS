@@ -5,8 +5,11 @@
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS registered_palms (
-    user_id TEXT PRIMARY KEY,
-    embeddings BLOB NOT NULL
+    user_id TEXT,
+    handedness TEXT,
+    name TEXT,
+    embeddings BLOB NOT NULL,
+    PRIMARY KEY (user_id, handedness)
 );
 
 

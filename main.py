@@ -25,7 +25,9 @@ from registration import (
     palm_bbox_from_landmarks,
     register_user,
     validate_consistency,
+    normalize_palm_orientation,
 )
+from verification import verify_palm
 
 
 @dataclass
@@ -36,8 +38,8 @@ class AppConfig:
     height: Optional[int] = None
     immediate_forwarding: bool = True
     buffered_mode: bool = False
-    palm_only: bool = False
-    palm_region_only: bool = False
+    palm_only: bool = True
+    palm_region_only: bool = True
     # Performance and behavior
     max_fps: Optional[float] = 30.0
     process_every: int = 1
@@ -48,6 +50,10 @@ class AppConfig:
     mp_max_hands: int = 2
     mp_det_conf: float = 0.5
     mp_track_conf: float = 0.5
+    # Palm verification settings
+    enforce_handedness: bool = True  # Whether to enforce handedness matching during verification
+    manual_handedness: bool = False  # Whether to allow manual handedness override
+    mirror_correction: bool = True  # Whether to correct for camera mirroring
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -60,6 +66,102 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
+def get_hand_side_selection() -> str:
+    """Get hand side selection from user."""
+    while True:
+        try:
+            print("\n" + "="*50)
+            print("PALM REGISTRATION - HAND SIDE SELECTION")
+            print("="*50)
+            print("Which hand would you like to register?")
+            print("1. Left hand")
+            print("2. Right hand")
+            print("="*50)
+            
+            choice = input("Enter your choice (1 or 2): ").strip()
+            
+            if choice == "1":
+                return "Left"
+            elif choice == "2":
+                return "Right"
+            else:
+                print("Invalid choice. Please enter 1 for Left hand or 2 for Right hand.")
+        except KeyboardInterrupt:
+            print("\nRegistration cancelled by user.")
+            return None
+        except Exception:
+            print("Invalid input. Please try again.")
+
+
+def get_user_name() -> str:
+    """Get user name from terminal input."""
+    while True:
+        try:
+            print("\n" + "="*50)
+            print("REGISTRATION SUCCESSFUL!")
+            print("="*50)
+            name = input("Please enter your name: ").strip()
+            
+            if name:
+                return name
+            else:
+                print("Name cannot be empty. Please enter a valid name.")
+        except KeyboardInterrupt:
+            print("\nUsing default name 'Unknown'.")
+            return "Unknown"
+        except Exception:
+            print("Invalid input. Please try again.")
+
+
+def get_manual_handedness(detected_handedness: Optional[str]) -> str:
+    """Get manual handedness correction from user."""
+    while True:
+        try:
+            print("\n" + "="*50)
+            print("HANDEDNESS DETECTION")
+            print("="*50)
+            if detected_handedness:
+                print(f"MediaPipe detected: {detected_handedness} hand")
+                print("Is this correct?")
+            else:
+                print("MediaPipe could not detect handedness")
+                print("Which hand are you showing?")
+            print("1. Left hand")
+            print("2. Right hand")
+            print("="*50)
+            
+            choice = input("Enter your choice (1 or 2): ").strip()
+            
+            if choice == "1":
+                return "Left"
+            elif choice == "2":
+                return "Right"
+            else:
+                print("Invalid choice. Please enter 1 for Left hand or 2 for Right hand.")
+        except KeyboardInterrupt:
+            print("\nUsing detected handedness or default.")
+            return detected_handedness or "Right"
+        except Exception:
+            print("Invalid input. Please try again.")
+
+
+def correct_handedness_for_mirror(handedness: Optional[str]) -> Optional[str]:
+    """Correct handedness for camera mirroring.
+    
+    Camera feeds are typically mirrored, so MediaPipe's handedness detection
+    gets reversed. This function corrects that.
+    """
+    if handedness is None:
+        return None
+    
+    if handedness == "Left":
+        return "Right"
+    elif handedness == "Right":
+        return "Left"
+    else:
+        return handedness
+
+
 def parse_args() -> AppConfig:
     parser = argparse.ArgumentParser(description="Palm detection with pluggable backends")
     parser.add_argument("--backend", choices=["mediapipe", "edgeimpulse"], default="mediapipe", help="Detection backend")
@@ -67,8 +169,8 @@ def parse_args() -> AppConfig:
     parser.add_argument("--width", type=int, default=None, help="Desired frame width")
     parser.add_argument("--height", type=int, default=None, help="Desired frame height")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
-    parser.add_argument("--palm-only", action="store_true", help="Filter to open palm detections only (heuristic)")
-    parser.add_argument("--palm-region-only", action="store_true", help="Draw and return only the palm region (no fingers)")
+    parser.add_argument("--no-palm-only", action="store_false", dest="palm_only", help="Disable palm-only filtering (allow all hand poses)")
+    parser.add_argument("--no-palm-region-only", action="store_false", dest="palm_region_only", help="Show full hand landmarks instead of palm region only")
     parser.add_argument("--max-fps", type=float, default=30.0, help="Limit processing FPS (e.g., 15, 30). Use 0 or negative for unlimited")
     parser.add_argument("--process-every", type=int, default=1, help="Process every Nth frame when not registering (1=every)")
     parser.add_argument("--mp-max-hands", type=int, default=2, help="Maximum number of hands to detect (mediapipe)")
@@ -76,6 +178,11 @@ def parse_args() -> AppConfig:
     parser.add_argument("--mp-track-conf", type=float, default=0.5, help="Minimum tracking confidence (mediapipe)")
     parser.add_argument("--camera-buffer-size", type=int, default=None, help="Hint buffer size for camera capture (backend-dependent)")
     parser.add_argument("--cv2-threads", type=int, default=None, help="Set OpenCV thread count (e.g., 1 to reduce CPU)")
+    parser.add_argument("--enforce-handedness", action="store_true", default=True, help="Enforce handedness matching during verification")
+    parser.add_argument("--no-enforce-handedness", action="store_false", dest="enforce_handedness", help="Disable handedness matching during verification")
+    parser.add_argument("--manual-handedness", action="store_true", help="Allow manual handedness override during verification")
+    parser.add_argument("--mirror-correction", action="store_true", default=True, help="Correct handedness for camera mirroring (default: enabled)")
+    parser.add_argument("--no-mirror-correction", action="store_false", dest="mirror_correction", help="Disable mirror correction for handedness")
     try:
         bool_action = argparse.BooleanOptionalAction  # Python 3.9+
         parser.add_argument("--immediate-forwarding", action=bool_action, default=True, help="ESP32 streams directly for detection (placeholder)")
@@ -122,6 +229,9 @@ def parse_args() -> AppConfig:
         mp_max_hands=int(args.mp_max_hands),
         mp_det_conf=float(args.mp_det_conf),
         mp_track_conf=float(args.mp_track_conf),
+        enforce_handedness=getattr(args, "enforce_handedness", True),
+        manual_handedness=getattr(args, "manual_handedness", False),
+        mirror_correction=getattr(args, "mirror_correction", True),
     )
 
 
@@ -171,16 +281,29 @@ def main() -> None:
     registering: bool = False
     user_id: Optional[str] = None
     snapshots: list[Snapshot] = []
-    total_targets: int = 10
+    total_targets: int = 15
     max_frames_to_try: int = 300  # allow more time; counts only when no detections
     frames_tried: int = 0
     waiting_for_movement: bool = False  # ensure one snapshot per guidance step
     last_bbox: Optional[tuple[int, int, int, int]] = None
     step_ready_at: Optional[float] = None  # 2s buffer before each snapshot
-    status_text: str = "Press 'r' to Register Palm. Press 'q' to quit."
+    status_text: str = "Auto-verification active. Press 'r' to Register Palm, 'q' to quit."
     last_capture_flash_at: Optional[float] = None
     last_announced_step_index: int = -1
     next_guide_ready_at: Optional[float] = None  # announce next guidance after this time
+    registration_handedness: Optional[str] = None  # Track handedness during registration
+
+    # Verification state - auto-start on program launch
+    verifying: bool = True
+    verify_snapshots: list[Snapshot] = []
+    verify_total_targets: int = 5
+    verify_frames_tried: int = 0
+    verify_settle_start: Optional[float] = None  # when palm first detected, start 2s settle timer
+    verify_last_capture_flash_at: Optional[float] = None
+    verify_capture_interval: float = 0.5  # 0.5s between snapshots
+    verify_last_capture_time: Optional[float] = None
+    verify_handedness: Optional[str] = None  # Track handedness of hand being verified
+    verify_cooldown_until: Optional[float] = None  # Buffer after verification
 
     guidance_msgs = [
         "Hold steady…",
@@ -192,7 +315,20 @@ def main() -> None:
         "Tilt palm down a bit…",
         "Shift slightly left…",
         "Shift slightly right…",
-        "Return to neutral position…",
+        "Spread fingers wider…",
+        "Bring fingers closer together…",
+        "Tilt wrist left…",
+        "Tilt wrist right…",
+        "Move hand up slightly…",
+        "Final steady position…",
+    ]
+
+    verify_guidance_msgs = [
+        "Hold steady…",
+        "Move hand slightly closer…",
+        "Rotate wrist slightly…",
+        "Hold steady…",
+        "Hold steady…",
     ]
 
     def print_line(lines: list[str]) -> None:
@@ -215,12 +351,20 @@ def main() -> None:
                 logger.warning("No frame received from source.")
                 break
 
-            # Process stride: when not registering, process every Nth frame to save CPU
-            should_process = True if registering else (config.process_every <= 1 or (frame_index % config.process_every == 0))
-            if should_process:
-                annotated, detections = detector.detect(frame)
-            else:
+            # Check cooldown period before any detection processing
+            now = time.time()
+            if verifying and not registering and verify_cooldown_until is not None and now < verify_cooldown_until:
+                remaining_cooldown = verify_cooldown_until - now
+                status_text = f"Verification cooldown: {remaining_cooldown:.1f}s remaining"
+                # Skip all detection during cooldown
                 annotated, detections = frame, []
+            else:
+                # Process stride: when not registering, process every Nth frame to save CPU
+                should_process = True if registering else (config.process_every <= 1 or (frame_index % config.process_every == 0))
+                if should_process:
+                     annotated, detections = detector.detect(frame)
+                else:
+                    annotated, detections = frame, []
             # After first frame, set window to the camera's native size without downscaling
             if config.display and not window_sized:
                 try:
@@ -232,7 +376,102 @@ def main() -> None:
                     pass
                 window_sized = True
 
-            if registering:
+            if verifying and not registering:
+                # Auto-verification: simple 2s settle + 5 snapshots at 0.5s intervals
+                current_count = len(verify_snapshots)
+                status_text = f"Auto-verification: {current_count}/{verify_total_targets} snapshots"
+                
+                if len(detections) > 0:
+                    verify_frames_tried = 0  # reset miss counter when palm visible
+                    # Use the largest bbox if multiple detections
+                    det = max(detections, key=lambda d: (d.bbox[2] * d.bbox[3]))
+                    # Prefer palm-only bbox if landmarks available
+                    bbox = palm_bbox_from_landmarks(det.landmarks) if det.landmarks is not None else det.bbox
+                    
+                    # Start settle timer when palm first detected
+                    if verify_settle_start is None:
+                        verify_settle_start = now
+                        # Apply mirror correction if enabled
+                        raw_handedness = det.handedness
+                        if config.mirror_correction:
+                            verify_handedness = correct_handedness_for_mirror(raw_handedness)
+                        else:
+                            verify_handedness = raw_handedness
+                        print_line([f"Palm detected ({verify_handedness or 'Unknown'} hand). Settling for 2 seconds..."])
+                    
+                    # Check if settle time is complete and ready to capture
+                    settle_elapsed = now - verify_settle_start
+                    if settle_elapsed >= 2.0 and current_count < verify_total_targets:
+                        # Check if enough time has passed since last capture
+                        if verify_last_capture_time is None or (now - verify_last_capture_time) >= verify_capture_interval:
+                            roi = crop_roi(frame, bbox, pad=8)
+                            if roi.size > 0 and roi.shape[0] >= 16 and roi.shape[1] >= 16:
+                                # Normalize palm orientation before extracting embedding
+                                normalized_roi = normalize_palm_orientation(roi, det.landmarks)
+                                emb = extract_embedding(normalized_roi)
+                                verify_snapshots.append(Snapshot(roi_bgr=normalized_roi, bbox_xywh=bbox, landmarks_xy=det.landmarks, embedding=emb))
+                                verify_last_capture_time = now
+                                verify_last_capture_flash_at = now
+                                print_line([f"Captured snapshot {len(verify_snapshots)}/{verify_total_targets}"])
+                else:
+                    # No detections; reset settle timer
+                    verify_settle_start = None
+                    verify_handedness = None
+                    verify_frames_tried += 1  # count only when palm not detected
+                
+                # Check if we have enough snapshots to verify
+                if len(verify_snapshots) >= verify_total_targets:
+                    # Verify against database
+                    valid_embeddings = [s.embedding for s in verify_snapshots if s.embedding is not None]
+                    valid_embeddings_np = [e for e in valid_embeddings if isinstance(e, np.ndarray) and e.size > 0]
+                    if len(valid_embeddings_np) >= 5:  # Require exactly 5 snapshots
+                        # Use the captured handedness if enforcement is enabled
+                        handedness = None
+                        if config.enforce_handedness:
+                            if config.manual_handedness:
+                                # Allow manual override of handedness
+                                handedness = get_manual_handedness(verify_handedness)
+                            else:
+                                handedness = verify_handedness
+                        
+                        is_match, matched_user, matched_name = verify_palm(valid_embeddings_np, handedness=handedness)
+                        if is_match:
+                            display_name = matched_name if matched_name and matched_name != "Unknown" else matched_user
+                            status_text = f"Palm validated! User: {display_name}"
+                            print_line([f"Palm validated! User: {display_name}"])
+                            print_line(["Signal sent to ESP32"])
+                            # Set cooldown period
+                            verify_cooldown_until = now + 1.0  # 1 second buffer
+                        else:
+                            status_text = "Unauthorized palm!"
+                            print_line(["Unauthorized palm!"])
+                            # Set cooldown period for failed verification too
+                            verify_cooldown_until = now + 1.0  # 1 second buffer
+                    else:
+                        status_text = "Verification failed — insufficient valid snapshots."
+                        print_line(["Verification failed — insufficient valid snapshots."])
+                    
+                    # Reset for next verification cycle
+                    verify_snapshots.clear()
+                    verify_settle_start = None
+                    verify_last_capture_time = None
+                    verify_handedness = None
+                    verify_cooldown_until = None  # Clear cooldown
+                    print_line(["Ready for next verification..."])
+                    status_text = "Auto-verification active. Press 'r' to Register Palm, 'q' to quit."
+                
+                # Cancel if palm disappears too long
+                elif verify_frames_tried >= max_frames_to_try:
+                    status_text = "Verification cancelled — palm not visible."
+                    verify_snapshots.clear()
+                    verify_settle_start = None
+                    verify_last_capture_time = None
+                    verify_handedness = None
+                    verify_cooldown_until = None  # Clear cooldown
+                    verify_frames_tried = 0
+                    print_line(["Verification cancelled. Ready for next attempt..."])
+                    status_text = "Auto-verification active. Press 'r' to Register Palm, 'q' to quit."
+            elif registering:
                 # Registration flow: capture up to total_targets validated snapshots
                 current_count = len(snapshots)
                 guide = guidance_msgs[min(current_count, len(guidance_msgs) - 1)]
@@ -295,14 +534,25 @@ def main() -> None:
                         if now >= step_ready_at:
                             roi = crop_roi(frame, bbox, pad=8)
                             if roi.size > 0 and roi.shape[0] >= 16 and roi.shape[1] >= 16:
-                                emb = extract_embedding(roi)
-                                snapshots.append(Snapshot(roi_bgr=roi, bbox_xywh=bbox, landmarks_xy=det.landmarks, embedding=emb))
+                                # Capture handedness on first snapshot
+                                if registration_handedness is None:
+                                    raw_handedness = det.handedness or "Right"  # Default to Right if not detected
+                                    # Apply mirror correction if enabled
+                                    if config.mirror_correction:
+                                        registration_handedness = correct_handedness_for_mirror(raw_handedness)
+                                    else:
+                                        registration_handedness = raw_handedness
+                                
+                                # Normalize palm orientation before extracting embedding
+                                normalized_roi = normalize_palm_orientation(roi, det.landmarks)
+                                emb = extract_embedding(normalized_roi)
+                                snapshots.append(Snapshot(roi_bgr=normalized_roi, bbox_xywh=bbox, landmarks_xy=det.landmarks, embedding=emb))
                                 last_bbox = bbox
                                 waiting_for_movement = True  # require movement before next snapshot
                                 frames_tried = 0  # reset tries on success to allow more time for next movement
                                 step_ready_at = None
                                 last_capture_flash_at = now
-                                print_line([f"Captured snapshot {len(snapshots)}/{total_targets} for '{user_id}'."])
+                                print_line([f"Captured snapshot {len(snapshots)}/{total_targets} for '{user_id}' ({registration_handedness} hand)."])
                                 # Schedule next guidance announcement in 1 second
                                 next_guide_ready_at = now + 1.0
                 else:
@@ -331,10 +581,16 @@ def main() -> None:
                     valid_embeddings = [s.embedding for s in snapshots if s.embedding is not None]
 
                     valid_embeddings_np = [e for e in valid_embeddings if isinstance(e, np.ndarray) and e.size > 0]
-                    if consistent and len(valid_embeddings_np) >= 7:
-                        ok = register_user(user_id or "unknown", valid_embeddings_np)
+                    if consistent and len(valid_embeddings_np) >= 10:  # Require at least 10 valid embeddings out of 15
+                        # Use the captured handedness
+                        handedness = registration_handedness or "Right"  # Default fallback
+                        
+                        # Prompt for user name
+                        user_name = get_user_name()
+                        
+                        ok = register_user(user_id or "unknown", valid_embeddings_np, handedness, user_name)
                         if ok:
-                            status_text = "Registration successful. Press 'r' to register another, 'q' to quit."
+                            status_text = f"Registration successful for {user_name} ({handedness} hand). Press 'r' to register another, 'q' to quit."
                         else:
                             status_text = "Registration failed — duplicate user ID or DB error."
                     else:
@@ -350,6 +606,7 @@ def main() -> None:
                     waiting_for_movement = False
                     last_bbox = None
                     step_ready_at = None
+                    registration_handedness = None
                     print_line([status_text, "Keys: r=register  q=quit"])
                     last_announced_step_index = -1
                     next_guide_ready_at = None
@@ -363,17 +620,32 @@ def main() -> None:
                     waiting_for_movement = False
                     last_bbox = None
                     step_ready_at = None
+                    registration_handedness = None
                     print_line([status_text, "Keys: r=register  q=quit"])
                     last_announced_step_index = -1
                     next_guide_ready_at = None
             else:
-                if len(detections) > 0:
+                if registering:
+                    # Registration is active, show registration status
+                    current_count = len(snapshots)
+                    status_text = f"Registration: {current_count}/{total_targets} snapshots"
+                elif len(detections) > 0:
                     logger.debug("Palm detected (%d)", len(detections))
+                    status_text = "Palm detected. Press 'r' to register, 'q' to quit."
                 else:
                     logger.debug("No palm detected")
+                    status_text = "No palm detected. Press 'r' to register, 'q' to quit."
 
-            # Visual indicators (no text): yellow border during countdown, green flash after capture
-            if registering:
+            # Visual indicators (no text): yellow border during settle, green flash after capture
+            if verifying and not registering:
+                now_vis = time.time()
+                if verify_settle_start is not None and (now_vis - verify_settle_start) < 2.0:
+                    cv2.rectangle(annotated, (2, 2), (annotated.shape[1]-3, annotated.shape[0]-3), (0, 255, 255), 2)
+                if verify_last_capture_flash_at is not None and (now_vis - verify_last_capture_flash_at) < 0.3:
+                    cv2.rectangle(annotated, (2, 2), (annotated.shape[1]-3, annotated.shape[0]-3), (0, 255, 0), 2)
+                elif verify_last_capture_flash_at is not None and (now_vis - verify_last_capture_flash_at) >= 0.3:
+                    verify_last_capture_flash_at = None
+            elif registering:
                 now_vis = time.time()
                 if step_ready_at is not None:
                     cv2.rectangle(annotated, (2, 2), (annotated.shape[1]-3, annotated.shape[0]-3), (0, 255, 255), 2)
@@ -396,6 +668,11 @@ def main() -> None:
                 logger.info("Quit requested by user.")
                 break
             if key == ord("r") and not registering:
+                # Get hand side selection from user
+                selected_hand = get_hand_side_selection()
+                if selected_hand is None:
+                    continue  # User cancelled
+                
                 # Auto-generate a random 16-char user_id with symbols
                 try:
                     import secrets
@@ -414,7 +691,8 @@ def main() -> None:
                 waiting_for_movement = False
                 last_bbox = None
                 step_ready_at = None
-                status_text = f"Starting registration for '{user_id}'. Show your palm."
+                registration_handedness = selected_hand
+                status_text = f"Starting registration for '{user_id}' ({selected_hand} hand). Show your {selected_hand.lower()} palm."
                 print_line([status_text, f"Snapshots: {len(snapshots)}/{total_targets}"])
                 last_announced_step_index = -1
                 next_guide_ready_at = None
@@ -426,10 +704,11 @@ def main() -> None:
                 waiting_for_movement = False
                 last_bbox = None
                 step_ready_at = None
-                status_text = "Registration cancelled by user."
-                print_line([status_text, "Keys: r=register  q=quit"])
+                registration_handedness = None
                 last_announced_step_index = -1
                 next_guide_ready_at = None
+                status_text = "Registration cancelled by user."
+                print_line([status_text, "Keys: r=register  c=cancel  q=quit"])
 
             # FPS limiter
             if config.max_fps is not None and config.max_fps > 0:

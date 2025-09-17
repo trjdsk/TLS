@@ -34,6 +34,7 @@ class DetectionResult:
     bbox: Tuple[int, int, int, int]  # x, y, w, h
     landmarks: Optional[np.ndarray]  # shape: (21, 2) in pixel coords, or None
     score: Optional[float]
+    handedness: Optional[str]  # "Left" or "Right" or None
 
 
 class PalmDetector:
@@ -148,13 +149,17 @@ class _MediaPipeHandDetector:
                 if self._palm_only and not self._is_open_palm(coords_np):
                     continue
 
-                # Confidence from handedness if available
+                # Confidence and handedness from handedness if available
                 score: Optional[float] = None
+                handedness: Optional[str] = None
                 if handedness_list and idx < len(handedness_list):
                     try:
-                        score = float(handedness_list[idx].classification[0].score)
+                        handedness_info = handedness_list[idx].classification[0]
+                        score = float(handedness_info.score)
+                        handedness = handedness_info.label  # "Left" or "Right"
                     except Exception:
                         score = None
+                        handedness = None
 
                 if self._palm_region_only:
                     # Compute palm polygon and bbox
@@ -186,6 +191,7 @@ class _MediaPipeHandDetector:
                             bbox=(x_min, y_min, w, h),
                             landmarks=coords_np,
                             score=score,
+                            handedness=handedness,
                         )
                     )
                 else:
@@ -219,6 +225,7 @@ class _MediaPipeHandDetector:
                             bbox=(x_min, y_min, w, h),
                             landmarks=coords_np,
                             score=score,
+                            handedness=handedness,
                         )
                     )
         else:
