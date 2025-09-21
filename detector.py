@@ -1,257 +1,193 @@
-"""Palm/hand detection backends.
+"""Palm detection pipeline: MediaPipe Hands + Edge Impulse validation.
 
-Defines a unified PalmDetector interface with pluggable backends.
-Current backends:
-- mediapipe: real-time hand detection with landmarks + bounding boxes
-- edgeimpulse: stubbed for future Edge Impulse .eim model integration
+Pipeline:
+1. MediaPipe Hands detects hand landmarks
+2. Extract palm ROI (wrist to MCP joints, excluding fingers)
+3. Preprocess ROI into 96x96 grayscale uint8
+4. Validate ROI with Edge Impulse model
+5. Return validated palm ROIs ready for verification
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
-import cv2  # avoid repeated per-call imports
+import cv2
 
 try:
     import mediapipe as mp  # type: ignore
-except Exception as exc:  # pragma: no cover - optional import for backend
-    mp = None  # type: ignore
+except Exception as exc:
+    mp = None
     _logging = logging.getLogger(__name__)
     _logging.debug("mediapipe import failed: %s", exc)
-
 
 logger = logging.getLogger(__name__)
 
 
-BackendName = Literal["mediapipe", "edgeimpulse"]
-
-
 @dataclass
 class DetectionResult:
-    """Represents a single hand detection result."""
+    """Represents a validated palm detection result."""
     bbox: Tuple[int, int, int, int]  # x, y, w, h
-    landmarks: Optional[np.ndarray]  # shape: (21, 2) in pixel coords, or None
+    landmarks: Optional[np.ndarray]  # shape: (21, 2) in pixel coords
     score: Optional[float]
-    handedness: Optional[str]  # "Left" or "Right" or None
+    handedness: Optional[str]        # "Left" / "Right"
+    is_valid_palm: bool              # True if EI model confirms palm
+    palm_roi: Optional[np.ndarray]   # Preprocessed 96x96 grayscale ROI
 
 
 class PalmDetector:
-    """Unified detector facade for palm/hand detection.
+    """Palm detection + Edge Impulse validation."""
 
-    Instantiate with a backend name and optional configuration.
-    """
-
-    def __init__(self, backend: BackendName = "mediapipe", **kwargs: Any) -> None:
-        self.backend: BackendName = backend
-        self._impl: Any
-
-        if backend == "mediapipe":
-            self._impl = _MediaPipeHandDetector(**kwargs)
-        elif backend == "edgeimpulse":
-            self._impl = _EdgeImpulsePalmDetectorStub(**kwargs)
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
-
-    def detect(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, List[DetectionResult]]:
-        """Run detection on a BGR frame.
-
-        Returns annotated frame and list of detections.
-        """
-        return self._impl.detect(frame_bgr)
-
-    def close(self) -> None:
-        """Release backend resources if any."""
-        close_method = getattr(self._impl, "close", None)
-        if callable(close_method):
-            close_method()
-
-
-class _MediaPipeHandDetector:
-    """MediaPipe Hands backend implementation."""
-
-    def __init__(self, max_num_hands: int = 2, detection_confidence: float = 0.5, tracking_confidence: float = 0.5, palm_only: bool = False, palm_region_only: bool = False) -> None:
+    def __init__(self,
+                 max_num_hands: int = 1,
+                 detection_confidence: float = 0.5,
+                 tracking_confidence: float = 0.5,
+                 palm_threshold: float = 0.5) -> None:
         if mp is None:
-            raise ImportError("mediapipe is required for the mediapipe backend")
+            raise ImportError("mediapipe is required for palm detection")
+
         self._mp_hands = mp.solutions.hands
-        self._mp_drawing = mp.solutions.drawing_utils
         self._hands = self._mp_hands.Hands(
             max_num_hands=max_num_hands,
             min_detection_confidence=detection_confidence,
             min_tracking_confidence=tracking_confidence,
         )
-        self._palm_only = palm_only
-        self._palm_region_only = palm_region_only
+        self._palm_threshold = palm_threshold
 
-    @staticmethod
-    def _is_open_palm(landmarks_xy: np.ndarray) -> bool:
-        """Heuristic: consider palm open if 4+ fingers (excluding thumb) are extended.
-
-        Uses relative distance from wrist (0) to finger TIP vs PIP joints.
-        This is orientation-agnostic by comparing distances, not raw axes.
-        """
-        if landmarks_xy.shape != (21, 2):
-            return False
-
-        wrist = landmarks_xy[0]
-        finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-
-        def dist(a: np.ndarray, b: np.ndarray) -> float:
-            v = a.astype(np.float32) - b.astype(np.float32)
-            return float(np.linalg.norm(v))
-
-        extended_count = 0
-        for tip_idx, pip_idx in finger_pairs:
-            tip_farther = dist(landmarks_xy[tip_idx], wrist) > dist(landmarks_xy[pip_idx], wrist) * 1.1
-            if tip_farther:
-                extended_count += 1
-
-        thumb_extended = dist(landmarks_xy[4], wrist) > dist(landmarks_xy[2], wrist) * 1.05
-        if thumb_extended:
-            extended_count += 1
-
-        return extended_count >= 4
-
-    @staticmethod
-    def _palm_polygon(landmarks_xy: np.ndarray) -> np.ndarray:
-        """Construct a polygon approximating the palm area (excluding fingers).
-
-        Uses a subset of palm-base landmarks and returns a convex hull.
-        """
-        # Landmarks that approximate palm base: wrist + MCP/CMC joints
-        indices = [0, 1, 2, 5, 9, 13, 17]
-        pts = landmarks_xy[indices]
-        hull = cv2.convexHull(pts.reshape(-1, 1, 2)).reshape(-1, 2)
-        return hull.astype(int)
+        # Load Edge Impulse wrapper
+        try:
+            from model_wrapper import EdgeImpulseModel
+            self._ei = EdgeImpulseModel()
+            if self._ei.is_initialized:
+                logger.info("Edge Impulse model initialized")
+            else:
+                logger.warning("Failed to initialize Edge Impulse model")
+                self._ei = None
+        except Exception as exc:
+            logger.warning("Edge Impulse model not available: %s", exc)
+            self._ei = None
 
     def detect(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, List[DetectionResult]]:
-        frame_rgb = frame_bgr[:, :, ::-1]
-        results = self._hands.process(frame_rgb)
-
+        """Detect palms and validate with Edge Impulse."""
         detections: List[DetectionResult] = []
         annotated = frame_bgr.copy()
 
+        # Step 1: run MediaPipe Hands
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self._hands.process(frame_rgb)
+
         if results.multi_hand_landmarks:
-            image_h, image_w = annotated.shape[:2]
+            h, w = annotated.shape[:2]
             handedness_list = getattr(results, "multi_handedness", None)
 
             for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-                # Collect pixel coordinates
-                coords = []
-                for lm in hand_landmarks.landmark:
-                    x_px = int(lm.x * image_w)
-                    y_px = int(lm.y * image_h)
-                    coords.append((x_px, y_px))
-                coords_np = np.array(coords, dtype=np.int32)
+                coords = np.array(
+                    [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks.landmark],
+                    dtype=np.int32,
+                )
 
-                # Palm-only detection filter (hand pose)
-                if self._palm_only and not self._is_open_palm(coords_np):
-                    continue
-
-                # Confidence and handedness from handedness if available
-                score: Optional[float] = None
-                handedness: Optional[str] = None
+                # Handedness & confidence
+                score, handedness = None, None
                 if handedness_list and idx < len(handedness_list):
                     try:
                         handedness_info = handedness_list[idx].classification[0]
                         score = float(handedness_info.score)
-                        handedness = handedness_info.label  # "Left" or "Right"
+                        handedness = handedness_info.label
                     except Exception:
-                        score = None
-                        handedness = None
+                        pass
 
-                if self._palm_region_only:
-                    # Compute palm polygon and bbox
-                    palm_poly = self._palm_polygon(coords_np)
-                    x_min = int(np.min(palm_poly[:, 0]))
-                    y_min = int(np.min(palm_poly[:, 1]))
-                    x_max = int(np.max(palm_poly[:, 0]))
-                    y_max = int(np.max(palm_poly[:, 1]))
-                    w = max(0, x_max - x_min)
-                    h = max(0, y_max - y_min)
+                # Step 2: extract palm bbox
+                palm_bbox = self._extract_palm_bbox(coords)
+                if palm_bbox is None:
+                    continue
+                x_min, y_min, w_box, h_box = palm_bbox
+                x_max, y_max = x_min + w_box, y_min + h_box
 
-                    # Draw only palm polygon and bbox, no finger landmarks
-                    cv2.polylines(annotated, [palm_poly.reshape(-1, 1, 2)], isClosed=True, color=(0, 255, 255), thickness=2)
-                    cv2.rectangle(annotated, (x_min, y_min), (x_min + w, y_min + h), (0, 255, 255), 2)
-                    if score is not None:
-                        cv2.putText(
-                            annotated,
-                            f"conf: {score:.2f}",
-                            (x_min, max(0, y_min - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                # Pad a little
+                pad = 10
+                x_min, y_min = max(0, x_min - pad), max(0, y_min - pad)
+                x_max, y_max = min(w, x_max + pad), min(h, y_max + pad)
 
-                    detections.append(
-                        DetectionResult(
-                            bbox=(x_min, y_min, w, h),
-                            landmarks=coords_np,
-                            score=score,
-                            handedness=handedness,
-                        )
+                palm_roi = frame_bgr[y_min:y_max, x_min:x_max]
+
+                # Step 3: validate with EI
+                is_valid, processed_roi, ei_score = self._validate_palm(palm_roi)
+
+                # Log detection scores
+                logger.info("Detection - MediaPipe confidence: %.3f, Edge Impulse score: %.3f, handedness: %s, valid_palm: %s",
+                           score or 0.0, ei_score or 0.0, handedness or "unknown", is_valid)
+
+                detections.append(
+                    DetectionResult(
+                        bbox=(x_min, y_min, x_max - x_min, y_max - y_min),
+                        landmarks=coords,
+                        score=score,
+                        handedness=handedness,
+                        is_valid_palm=is_valid,
+                        palm_roi=processed_roi,
                     )
-                else:
-                    # Full hand landmarks and bbox (includes fingers)
-                    self._mp_drawing.draw_landmarks(
-                        annotated,
-                        hand_landmarks,
-                        self._mp_hands.HAND_CONNECTIONS,
-                    )
-                    x_min = int(np.min(coords_np[:, 0]))
-                    y_min = int(np.min(coords_np[:, 1]))
-                    x_max = int(np.max(coords_np[:, 0]))
-                    y_max = int(np.max(coords_np[:, 1]))
-                    w = max(0, x_max - x_min)
-                    h = max(0, y_max - y_min)
-                    cv2.rectangle(annotated, (x_min, y_min), (x_min + w, y_min + h), (0, 255, 0), 2)
-                    if score is not None:
-                        cv2.putText(
-                            annotated,
-                            f"conf: {score:.2f}",
-                            (x_min, max(0, y_min - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 0),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                )
 
-                    detections.append(
-                        DetectionResult(
-                            bbox=(x_min, y_min, w, h),
-                            landmarks=coords_np,
-                            score=score,
-                            handedness=handedness,
-                        )
-                    )
-        else:
-            logger.debug("No hands detected in current frame")
+                # Draw bbox
+                color = (0, 255, 0) if is_valid else (0, 0, 255)
+                cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), color, 2)
 
         return annotated, detections
 
+    def _extract_palm_bbox(self, landmarks: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Palm = wrist + MCP joints."""
+        if landmarks.shape != (21, 2):
+            return None
+        palm_indices = [0, 1, 2, 5, 9, 13, 17]
+        pts = landmarks[palm_indices]
+        x_min, y_min = np.min(pts[:, 0]), np.min(pts[:, 1])
+        x_max, y_max = np.max(pts[:, 0]), np.max(pts[:, 1])
+        if x_max - x_min < 20 or y_max - y_min < 20:
+            return None
+        return int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)
+
+    def _preprocess_roi(self, roi_bgr: np.ndarray) -> np.ndarray:
+        """Convert to 96x96 grayscale uint8."""
+        if roi_bgr.size == 0:
+            return np.zeros((96, 96), dtype=np.uint8)
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY) if roi_bgr.ndim == 3 else roi_bgr
+        resized = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
+        return resized.astype(np.uint8)
+
+    def _validate_palm(self, roi_bgr: np.ndarray) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
+        """Run EI model and check if ROI is palm."""
+        if self._ei is None or not self._ei.is_initialized:
+            return False, None, None
+
+        processed = self._preprocess_roi(roi_bgr)
+        
+        try:
+            # Use the Edge Impulse model's is_palm method
+            is_palm = self._ei.is_palm(processed, self._palm_threshold)
+            
+            # Get detailed scores for logging
+            palm_score = None
+            try:
+                scores, predicted_class = self._ei.predict(processed)
+                palm_score = scores[1] if len(scores) > 1 else scores[0]
+                logger.debug("Edge Impulse prediction: scores=%s, predicted=%s, palm_score=%.3f, threshold=%.3f", 
+                           scores, predicted_class, palm_score, self._palm_threshold)
+            except Exception as exc:
+                logger.warning("Could not get detailed Edge Impulse scores: %s", exc)
+            
+            logger.debug("Palm validation result: %s (threshold=%.3f)", is_palm, self._palm_threshold)
+            return is_palm, processed, palm_score
+            
+        except Exception as exc:
+            logger.error("Edge Impulse validation failed: %s", exc)
+            return False, processed, None
+
     def close(self) -> None:
-        self._hands.close()
-
-
-class _EdgeImpulsePalmDetectorStub:
-    """Placeholder for Edge Impulse .eim backend.
-
-    Raises NotImplementedError for detection, but keeps initialization shape.
-    """
-
-    def __init__(self, model_path: Optional[str] = None, **_: Any) -> None:
-        self.model_path = model_path
-        logger.info("Edge Impulse backend selected, but not implemented yet. model_path=%s", model_path)
-
-    def detect(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, List[DetectionResult]]:
-        raise NotImplementedError("Edge Impulse backend is not implemented yet. Provide a .eim model and implement inference.")
-
-    def close(self) -> None:
-        return None
+        if hasattr(self, "_hands"):
+            self._hands.close()
 
 
 __all__ = ["PalmDetector", "DetectionResult"]

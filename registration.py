@@ -96,6 +96,31 @@ def serialize_embeddings(embeddings_list: Sequence[np.ndarray]) -> bytes:
     return buf.getvalue()
 
 
+def verify_palm_for_registration(roi_bgr: np.ndarray, threshold: float = 0.5) -> bool:
+    """Verify that the ROI contains a palm using Edge Impulse model during registration.
+    
+    Args:
+        roi_bgr: Preprocessed palm ROI (96x96 grayscale)
+        threshold: Confidence threshold for palm detection
+        
+    Returns:
+        True if palm is detected, False otherwise
+    """
+    try:
+        from model_wrapper import get_model
+        
+        model = get_model()
+        if model.is_initialized:
+            # ROI should already be preprocessed by detector
+            return model.is_palm(roi_bgr, threshold)
+        else:
+            logger.warning("Edge Impulse model not initialized, cannot verify palm during registration")
+            return True  # Allow registration to proceed if model not available
+    except Exception as exc:
+        logger.warning("Edge Impulse model not available for registration verification: %s", exc)
+        return True  # Allow registration to proceed if model not available
+
+
 def register_user(user_id: str, embeddings_list: Sequence[np.ndarray], handedness: str = "Right", name: str = "Unknown", db_path: str = DB_PATH) -> bool:
     ensure_db(db_path)
     try:
@@ -217,7 +242,32 @@ def normalize_palm_orientation(roi_bgr: np.ndarray, landmarks_xy: Optional[np.nd
 
 
 def extract_embedding(roi_bgr: np.ndarray) -> np.ndarray:
-    """Robust palm embedding extractor using multiple feature types (4096 dimensions).
+    """Extract palm embedding using Edge Impulse model.
+
+    Uses the Edge Impulse trained model to extract discriminative features
+    for palm recognition. The ROI should already be preprocessed (96x96 grayscale).
+    """
+    try:
+        # Try to use Edge Impulse model first
+        from model_wrapper import get_model
+        
+        model = get_model()
+        if model.is_initialized:
+            # ROI should already be preprocessed by detector
+            embedding = model.get_embedding(roi_bgr, embedding_size=128)
+            logger.debug("Extracted embedding using Edge Impulse model, shape: %s", embedding.shape)
+            return embedding
+        else:
+            logger.warning("Edge Impulse model not initialized, falling back to custom features")
+    except Exception as exc:
+        logger.warning("Edge Impulse model not available, falling back to custom features: %s", exc)
+    
+    # Fallback to custom feature extraction
+    return _extract_custom_embedding(roi_bgr)
+
+
+def _extract_custom_embedding(roi_bgr: np.ndarray) -> np.ndarray:
+    """Fallback custom palm embedding extractor using multiple feature types (4096 dimensions).
 
     Uses a combination of approaches to create highly discriminative embeddings:
     1. Raw pixel features with quantization

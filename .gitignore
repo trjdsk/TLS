@@ -1,32 +1,36 @@
 # SQLite database files
 palms.db
 *.db
+*.db.backup
+
+# Debug artifacts
+debug/
+debug_*/
+
+# Model build artifacts
+model/build/
+model/lib/
+model/*.so
+model/*.dll
 
 # Python cache
 __pycache__/
 *.py[cod]
-
-# Palm registration artifacts and database
-palms.db
-
-# Python
-__pycache__/
 *.pyc
 *.pyo
 *.pyd
+*$py.class
+
+# Test files
+test_*.py
 
 # OS/editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
 # Virtual environments
 .venv/
-
-# Python cache/bytecode
-__pycache__/
-**/__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*$py.class
+venv/
+env/

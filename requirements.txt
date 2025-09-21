@@ -2,4 +2,6 @@ numpy>=1.26,<2.0
 opencv-python>=4.7
 mediapipe==0.10.14
 scikit-image>=0.19.0
-# Optional, planned for later backend integration
+# Edge Impulse model integration
+# Note: Edge Impulse C++ library must be built separately using model/build.sh or model/build.bat
+# The hybrid approach uses MediaPipe Hands for ROI detection and Edge Impulse for palm verification

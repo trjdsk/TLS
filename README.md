@@ -1,11 +1,12 @@
 # TLS Palm Recognition System
 
-A robust, real-time palm recognition system built with Python, OpenCV, MediaPipe Hands, and SQLite. This system provides secure palm-based authentication with advanced features including handedness detection, palm orientation normalization, and strict verification protocols.
+A robust, real-time palm recognition system built with Python, OpenCV, MediaPipe Hands, and Edge Impulse. This system provides secure palm-based authentication with advanced features including handedness detection, palm orientation normalization, and strict verification protocols.
 
 ## 🚀 Features
 
 ### Core Capabilities
 - **Real-time Palm Detection**: Uses MediaPipe Hands for accurate hand tracking and landmark detection
+- **Edge Impulse Integration**: Advanced palm verification using trained TensorFlow Lite models
 - **Handedness-Aware Recognition**: Separate registration and verification for left and right hands
 - **Palm Orientation Normalization**: Consistent palm orientation for improved recognition accuracy
 - **Strict Verification Protocols**: High-precision matching with variance checking
@@ -13,11 +14,12 @@ A robust, real-time palm recognition system built with Python, OpenCV, MediaPipe
 - **SQLite Database**: Persistent storage with automatic schema migration
 
 ### Advanced Features
-- **Modular Design**: Easy integration with Edge Impulse models (planned)
+- **Hybrid Detection Pipeline**: MediaPipe for fast detection + Edge Impulse for palm verification
 - **Configurable Thresholds**: Adjustable similarity and variance parameters
 - **Handedness Enforcement**: Toggleable left/right hand matching
 - **Palm-Only Mode**: Filters to open palm detections only (default)
 - **Palm Region Focus**: Extracts palm-only regions excluding fingers (default)
+- **ESP32 Ready**: Communication framework for hardware deployment
 
 ## 📋 Requirements
 
@@ -152,8 +154,27 @@ main.py              # Main application entry point
 ├── detector.py      # Palm detection backends (MediaPipe/Edge Impulse)
 ├── registration.py  # Palm registration and embedding extraction
 ├── verification.py  # Palm verification and matching
+├── model_wrapper.py # Edge Impulse model interface
+├── model/           # Edge Impulse model and SDK
+│   ├── edge-impulse-sdk/      # Edge Impulse SDK
+│   ├── tflite-model/          # TensorFlow Lite model
+│   ├── model-parameters/      # Model metadata
+│   └── libedge_impulse_model.so  # Compiled model library
 └── schema.sql       # Database schema definition
 ```
+
+### Edge Impulse Integration
+
+The system uses a **hybrid approach** combining:
+- **MediaPipe Hands** for fast hand detection and ROI extraction
+- **Edge Impulse C++ model** for palm verification and recognition
+
+#### Model Specifications
+- **Input**: 96x96 grayscale images
+- **Output**: 2 classes ("not_palm", "palm")  
+- **Framework**: TensorFlow Lite with INT8 quantization
+- **Memory**: ~361KB model size
+- **Inference Speed**: ~5-10ms per frame
 
 ### Database Schema
 

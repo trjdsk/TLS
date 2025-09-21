@@ -142,3 +142,55 @@ def test_embedding_compatibility(roi_bgr: np.ndarray) -> np.ndarray:
     embedding = extract_embedding(roi_bgr)
     logger.info("Generated embedding shape: %s, norm: %.3f", embedding.shape, np.linalg.norm(embedding))
     return embedding
+
+
+def verify_palm_with_edge_impulse(roi_bgr: np.ndarray, threshold: float = 0.5) -> bool:
+    """
+    Verify if the ROI contains a palm using Edge Impulse model.
+    
+    Args:
+        roi_bgr: Preprocessed palm ROI (96x96 grayscale)
+        threshold: Confidence threshold for palm detection
+        
+    Returns:
+        True if palm is detected, False otherwise
+    """
+    try:
+        from model_wrapper import get_model
+        
+        model = get_model()
+        if model.is_initialized:
+            # ROI should already be preprocessed by detector
+            return model.is_palm(roi_bgr, threshold)
+        else:
+            logger.warning("Edge Impulse model not initialized, cannot verify palm")
+            return False
+    except Exception as exc:
+        logger.warning("Edge Impulse model not available for verification: %s", exc)
+        return False
+
+
+def get_palm_confidence(roi_bgr: np.ndarray) -> float:
+    """
+    Get palm detection confidence score using Edge Impulse model.
+    
+    Args:
+        roi_bgr: Preprocessed palm ROI (96x96 grayscale)
+        
+    Returns:
+        Confidence score (0.0 to 1.0), or -1.0 if model not available
+    """
+    try:
+        from model_wrapper import get_model
+        
+        model = get_model()
+        if model.is_initialized:
+            # ROI should already be preprocessed by detector
+            scores, predicted_class = model.predict(roi_bgr)
+            return float(scores[1])  # "palm" class score
+        else:
+            logger.warning("Edge Impulse model not initialized, cannot get confidence")
+            return -1.0
+    except Exception as exc:
+        logger.warning("Edge Impulse model not available for confidence scoring: %s", exc)
+        return -1.0
