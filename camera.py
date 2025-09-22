@@ -1,36 +1,42 @@
-"""Camera input module.
+"""Camera input module with palm detection integration.
 
-Provides a simple wrapper over OpenCV's VideoCapture to support
-webcam indices and network stream URLs (e.g., ESP32 streams in future).
+Provides camera interface that integrates with palm detection system.
+Returns annotated frames with palm bounding boxes and palm crops for processing.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import cv2
 import numpy as np
 
+from detector import PalmDetector, PalmDetection
 
 logger = logging.getLogger(__name__)
 
 
 class VideoCapture:
-    """Abstraction for video input.
+    """Abstraction for video input with palm detection.
 
     Currently supports laptop webcam via integer index and URL streams.
+    Integrates with palm detection to provide annotated frames and palm crops.
 
     Attributes:
         source: Camera index (int) or stream URL (str).
         width: Optional desired frame width.
         height: Optional desired frame height.
+        detector: PalmDetector instance for palm detection.
     """
 
-    def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, height: Optional[int] = None, buffer_size: Optional[int] = None) -> None:
+    def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, 
+                 height: Optional[int] = None, buffer_size: Optional[int] = None,
+                 detector: Optional[PalmDetector] = None) -> None:
         self.source: Union[int, str] = source
         self.width: Optional[int] = width
         self.height: Optional[int] = height
         self.buffer_size: Optional[int] = buffer_size
+        self.detector: Optional[PalmDetector] = detector
         self._cap: Optional[cv2.VideoCapture] = None
 
     def open(self) -> None:
@@ -66,6 +72,37 @@ class VideoCapture:
             logger.debug("Failed to read frame from source: %s", self.source)
         return ret, frame
 
+    def get_palm_frame(self) -> Tuple[bool, Optional[np.ndarray], List[np.ndarray]]:
+        """
+        Get frame with palm detection and return annotated frame + palm crops.
+        
+        Returns:
+            Tuple of (success, annotated_frame, palm_crops)
+            - success: True if frame was read successfully
+            - annotated_frame: Frame with palm bounding boxes and annotations
+            - palm_crops: List of 96x96 grayscale palm crops for processing
+        """
+        ret, frame = self.read()
+        if not ret or frame is None:
+            return False, None, []
+        
+        if self.detector is None:
+            # No detector available, return original frame
+            return True, frame, []
+        
+        try:
+            # Run palm detection
+            annotated_frame, detections = self.detector.detect(frame)
+            
+            # Extract palm crops from valid detections
+            palm_crops = [det.palm_roi for det in detections if det.is_valid_palm]
+            
+            return True, annotated_frame, palm_crops
+            
+        except Exception as e:
+            logger.error("Palm detection failed: %s", e)
+            return True, frame, []
+
     def release(self) -> None:
         """Release the video resource."""
         if self._cap is not None:
@@ -74,4 +111,21 @@ class VideoCapture:
             self._cap = None
 
 
-__all__ = ["VideoCapture"]
+def get_palm_frame(cap: VideoCapture) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
+    """
+    Legacy function for backward compatibility.
+    
+    Args:
+        cap: VideoCapture instance with palm detector
+        
+    Returns:
+        Tuple of (annotated_frame, palm_crops)
+    """
+    success, annotated_frame, palm_crops = cap.get_palm_frame()
+    if success:
+        return annotated_frame, palm_crops
+    else:
+        return None, []
+
+
+__all__ = ["VideoCapture", "get_palm_frame"]

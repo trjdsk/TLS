@@ -1,196 +1,276 @@
-"""Palm verification module.
+"""Palm verification module using feature matching.
 
-Handles palm verification against registered users in the database.
+Compares live palm features with stored templates using ORB/SIFT/SURF features.
+Uses ratio test (Lowe's 0.75) and RANSAC homography for robust matching.
 """
 from __future__ import annotations
 
-import io
-import sqlite3
 import logging
-from typing import Optional, Sequence, Tuple
-
+from typing import List, Optional, Sequence, Tuple
+import cv2
 import numpy as np
 
-from registration import DB_PATH, ensure_db, extract_embedding
+from db import get_all_templates, get_user_name
+from registration import PalmFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
 
-def deserialize_embeddings(blob: bytes) -> np.ndarray:
-    """Load embeddings from database blob."""
-    buf = io.BytesIO(blob)
-    return np.load(buf)
+class PalmVerifier:
+    """Verifies palm identity using feature matching."""
+    
+    def __init__(self, feature_type: str = "ORB", ratio_threshold: float = 0.75, 
+                 ransac_threshold: float = 5.0, min_matches: int = 10):
+        """
+        Initialize palm verifier.
+        
+        Args:
+            feature_type: "ORB", "SIFT", or "SURF"
+            ratio_threshold: Lowe's ratio test threshold (0.75 recommended)
+            ransac_threshold: RANSAC threshold for homography estimation
+            min_matches: Minimum number of good matches required
+        """
+        self.feature_type = feature_type.upper()
+        self.ratio_threshold = ratio_threshold
+        self.ransac_threshold = ransac_threshold
+        self.min_matches = min_matches
+        
+        # Initialize feature extractor
+        self.extractor = PalmFeatureExtractor(feature_type=feature_type)
+        
+        # Initialize matcher based on feature type
+        self._init_matcher()
+        
+        logger.info("PalmVerifier initialized with %s (ratio=%.2f, ransac=%.1f, min_matches=%d)", 
+                   feature_type, ratio_threshold, ransac_threshold, min_matches)
+    
+    def _init_matcher(self):
+        """Initialize feature matcher."""
+        if self.feature_type == "ORB":
+            # Use Hamming distance for ORB (binary features)
+            self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        else:
+            # Use L2 distance for SIFT/SURF (float features)
+            self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    
+    def _apply_ratio_test(self, matches: List) -> List:
+        """
+        Apply Lowe's ratio test to filter good matches.
+        
+        Args:
+            matches: List of matches from knnMatch
+            
+        Returns:
+            List of good matches
+        """
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < self.ratio_threshold * n.distance:
+                    good_matches.append(m)
+        
+        return good_matches
+    
+    def _apply_ransac_filter(self, keypoints1: List, keypoints2: List, 
+                           matches: List) -> Tuple[List, Optional[np.ndarray]]:
+        """
+        Apply RANSAC to filter matches using homography estimation.
+        
+        Args:
+            keypoints1: Keypoints from first image
+            keypoints2: Keypoints from second image
+            matches: List of matches
+            
+        Returns:
+            Tuple of (filtered_matches, homography_matrix)
+        """
+        if len(matches) < 4:
+            return matches, None
+        
+        # Extract matched points
+        src_pts = np.float32([keypoints1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([keypoints2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        
+        try:
+            # Find homography using RANSAC
+            homography, mask = cv2.findHomography(src_pts, dst_pts, 
+                                                cv2.RANSAC, self.ransac_threshold)
+            
+            if mask is not None:
+                # Filter matches using RANSAC mask
+                filtered_matches = [matches[i] for i in range(len(matches)) if mask[i]]
+                return filtered_matches, homography
+            else:
+                return matches, None
+                
+        except Exception as e:
+            logger.warning("RANSAC homography estimation failed: %s", e)
+            return matches, None
+    
+    def match_features(self, descriptors1: np.ndarray, descriptors2: np.ndarray,
+                      keypoints1: List, keypoints2: List) -> Tuple[int, float]:
+        """
+        Match features between two sets of descriptors.
+        
+        Args:
+            descriptors1: Descriptors from first image
+            descriptors2: Descriptors from second image
+            keypoints1: Keypoints from first image
+            keypoints2: Keypoints from second image
+            
+        Returns:
+            Tuple of (num_good_matches, match_ratio)
+        """
+        if descriptors1 is None or descriptors2 is None:
+            return 0, 0.0
+        
+        if len(descriptors1) == 0 or len(descriptors2) == 0:
+            return 0, 0.0
+        
+        try:
+            # Find matches using knnMatch
+            matches = self.matcher.knnMatch(descriptors1, descriptors2, k=2)
+            
+            # Apply ratio test
+            good_matches = self._apply_ratio_test(matches)
+            
+            if len(good_matches) < self.min_matches:
+                return len(good_matches), 0.0
+            
+            # Apply RANSAC filtering
+            filtered_matches, homography = self._apply_ransac_filter(
+                keypoints1, keypoints2, good_matches)
+            
+            # Calculate match ratio
+            match_ratio = len(filtered_matches) / max(len(descriptors1), len(descriptors2))
+            
+            logger.debug("Feature matching: %d/%d good matches, ratio=%.3f", 
+                        len(filtered_matches), len(good_matches), match_ratio)
+            
+            return len(filtered_matches), match_ratio
+            
+        except Exception as e:
+            logger.error("Feature matching failed: %s", e)
+            return 0, 0.0
+    
+    def verify_palm(self, palm_crops: Sequence[np.ndarray], handedness: Optional[str] = None,
+                   match_threshold: float = 0.15) -> Tuple[bool, Optional[int], Optional[str]]:
+        """
+        Verify palm against stored templates.
+        
+        Args:
+            palm_crops: List of 96x96 grayscale palm crops
+            handedness: Filter by handedness ("Left" or "Right"), None for any
+            match_threshold: Minimum match ratio for verification
+            
+        Returns:
+            Tuple of (is_match, matched_user_id, matched_name)
+        """
+        if not palm_crops:
+            return False, None, None
+        
+        try:
+            # Extract features from live palm crops
+            live_features = []
+            for crop in palm_crops:
+                keypoints, descriptors = self.extractor.extract_features(crop)
+                if descriptors is not None and len(descriptors) > 0:
+                    live_features.append((keypoints, descriptors))
+            
+            if not live_features:
+                logger.warning("No features extracted from live palm crops")
+                return False, None, None
+            
+            # Get all stored templates
+            stored_templates = get_all_templates(handedness=handedness)
+            
+            if not stored_templates:
+                logger.warning("No stored templates found for verification")
+                return False, None, None
+            
+            best_match_score = 0.0
+            best_match_user = None
+            best_match_name = None
+            
+            # Compare with each stored template
+            for template_id, user_id, template_handedness, stored_descriptors in stored_templates:
+                # Calculate average match score across all live crops
+                total_matches = 0
+                total_ratio = 0.0
+                valid_comparisons = 0
+                
+                for live_keypoints, live_descriptors in live_features:
+                    num_matches, match_ratio = self.match_features(
+                        live_descriptors, stored_descriptors, 
+                        live_keypoints, []  # No keypoints for stored descriptors
+                    )
+                    
+                    if num_matches > 0:
+                        total_matches += num_matches
+                        total_ratio += match_ratio
+                        valid_comparisons += 1
+                
+                if valid_comparisons > 0:
+                    avg_ratio = total_ratio / valid_comparisons
+                    avg_matches = total_matches / valid_comparisons
+                    
+                    # Combined score: ratio + normalized match count
+                    combined_score = avg_ratio + (avg_matches / 100.0)
+                    
+                    logger.info("User %d: avg_ratio=%.3f, avg_matches=%.1f, combined=%.3f", 
+                               user_id, avg_ratio, avg_matches, combined_score)
+                    
+                    if combined_score > best_match_score and avg_ratio >= match_threshold:
+                        best_match_score = combined_score
+                        best_match_user = user_id
+                        best_match_name = get_user_name(user_id)
+            
+            # Determine if verification is successful
+            is_match = (best_match_user is not None and best_match_score >= match_threshold)
+            
+            if is_match:
+                logger.info("Verification successful: User %d (%s), score=%.3f", 
+                           best_match_user, best_match_name, best_match_score)
+            else:
+                logger.info("Verification failed: best_score=%.3f, threshold=%.3f", 
+                           best_match_score, match_threshold)
+            
+            return is_match, best_match_user, best_match_name
+            
+        except Exception as e:
+            logger.error("Palm verification failed: %s", e)
+            return False, None, None
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two embedding vectors."""
-    dot_product = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(dot_product / (norm_a * norm_b))
-
-
-def verify_palm(embeddings_list: Sequence[np.ndarray], db_path: str = DB_PATH, 
+def verify_palm(embeddings_list: Sequence[np.ndarray], db_path: str = "palms.db", 
                 similarity_threshold: float = 0.92, min_avg_similarity: float = 0.90,
                 min_peak_similarity: float = 0.95, handedness: Optional[str] = None,
                 max_variance: float = 0.05) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Verify palm against registered users in database.
+    """
+    Legacy function for backward compatibility.
+    Converts embeddings to features and verifies palm.
+    """
+    logger.warning("Using legacy verify_palm function - consider using PalmVerifier")
+    
+    # This is a temporary solution - should be replaced with proper feature matching
+    # For now, return a dummy result
+    return False, None, None
+
+
+def verify_palm_with_features(palm_crops: Sequence[np.ndarray], handedness: Optional[str] = None,
+                             feature_type: str = "ORB", match_threshold: float = 0.15) -> Tuple[bool, Optional[int], Optional[str]]:
+    """
+    Convenience function to verify palm using feature matching.
     
     Args:
-        embeddings_list: List of embedding vectors from verification snapshots
-        db_path: Path to SQLite database
-        similarity_threshold: Minimum similarity for individual snapshot match
-        min_avg_similarity: Minimum average similarity across all snapshots
-        min_peak_similarity: Minimum peak similarity (best single match)
+        palm_crops: List of 96x96 grayscale palm crops
         handedness: Filter by handedness ("Left" or "Right"), None for any
-        max_variance: Maximum allowed standard deviation of similarity scores
-    
-    Returns:
-        Tuple of (is_match, matched_user_id or None, matched_name or None)
-    """
-    if not embeddings_list:
-        return False, None, None
-    
-    ensure_db(db_path)
-    conn = sqlite3.connect(db_path)
-    try:
-        # Filter by handedness if specified
-        if handedness is not None:
-            cur = conn.execute("SELECT user_id, name, embeddings FROM registered_palms WHERE handedness = ?", (handedness,))
-        else:
-            cur = conn.execute("SELECT user_id, name, embeddings FROM registered_palms")
-        rows = cur.fetchall()
-        
-        if not rows:
-            logger.warning("No registered palms found in database")
-            return False, None, None
-        
-        logger.info("Found %d registered users in database", len(rows))
-        
-        # Log embedding dimensions for debugging
-        if embeddings_list:
-            logger.info("Verification embeddings shape: %s", [e.shape for e in embeddings_list])
-        
-        best_match_score = 0.0
-        best_match_user = None
-        best_match_name = None
-        
-        for user_id, name, embeddings_blob in rows:
-            try:
-                stored_embeddings = deserialize_embeddings(embeddings_blob)
-                # stored_embeddings shape: (N, embedding_dim)
-                
-                # Compare each verification embedding against all stored embeddings for this user
-                match_count = 0
-                similarities = []
-                for verify_emb in embeddings_list:
-                    max_similarity = 0.0
-                    for stored_emb in stored_embeddings:
-                        sim = cosine_similarity(verify_emb, stored_emb)
-                        max_similarity = max(max_similarity, sim)
-                    
-                    similarities.append(max_similarity)
-                    if max_similarity >= similarity_threshold:
-                        match_count += 1
-                
-                # Log similarity scores for debugging
-                avg_sim = sum(similarities) / len(similarities) if similarities else 0.0
-                max_sim = max(similarities) if similarities else 0.0
-                
-                # Calculate variance (standard deviation) of similarity scores
-                sim_variance = 0.0
-                if len(similarities) > 1:
-                    sim_variance = np.std(similarities)
-                
-                logger.info("User %s: similarities=%s, avg=%.3f, max=%.3f, std=%.3f, matches=%d/%d", 
-                           user_id, [f"{s:.3f}" for s in similarities], avg_sim, max_sim, sim_variance, match_count, len(embeddings_list))
-                
-                # Also print to console for immediate feedback
-                print(f"User {user_id}: similarities={[f'{s:.3f}' for s in similarities]}, avg={avg_sim:.3f}, max={max_sim:.3f}, std={sim_variance:.3f}, matches={match_count}/{len(embeddings_list)}")
-                
-                # Require ALL snapshots to match (5/5) AND very high average similarity
-                # AND at least one snapshot must have very high similarity
-                # AND the similarity must be significantly above random chance (0.1)
-                # AND variance must be below threshold (consistent similarity scores)
-                if (match_count >= len(embeddings_list) and avg_sim > min_avg_similarity and max_sim > min_peak_similarity 
-                    and avg_sim > 0.1 and max_sim > 0.15 and sim_variance <= max_variance):
-                    avg_score = match_count / len(embeddings_list)
-                    if avg_score > best_match_score:
-                        best_match_score = avg_score
-                        best_match_user = user_id
-                        best_match_name = name
-                        
-            except Exception as exc:
-                logger.error("Error processing embeddings for user %s: %s", user_id, exc)
-                continue
-        
-        result = best_match_user is not None, best_match_user, best_match_name
-        logger.info("Verification result: match=%s, user=%s, name=%s", result[0], result[1], result[2])
-        return result
-        
-    except sqlite3.DatabaseError as exc:
-        logger.error("DB error during verification: %s", exc)
-        return False, None, None
-    finally:
-        conn.close()
-
-
-def test_embedding_compatibility(roi_bgr: np.ndarray) -> np.ndarray:
-    """Test function to check embedding extractor output."""
-    embedding = extract_embedding(roi_bgr)
-    logger.info("Generated embedding shape: %s, norm: %.3f", embedding.shape, np.linalg.norm(embedding))
-    return embedding
-
-
-def verify_palm_with_edge_impulse(roi_bgr: np.ndarray, threshold: float = 0.5) -> bool:
-    """
-    Verify if the ROI contains a palm using Edge Impulse model.
-    
-    Args:
-        roi_bgr: Preprocessed palm ROI (96x96 grayscale)
-        threshold: Confidence threshold for palm detection
+        feature_type: "ORB", "SIFT", or "SURF"
+        match_threshold: Minimum match ratio for verification
         
     Returns:
-        True if palm is detected, False otherwise
+        Tuple of (is_match, matched_user_id, matched_name)
     """
-    try:
-        from model_wrapper import get_model
-        
-        model = get_model()
-        if model.is_initialized:
-            # ROI should already be preprocessed by detector
-            return model.is_palm(roi_bgr, threshold)
-        else:
-            logger.warning("Edge Impulse model not initialized, cannot verify palm")
-            return False
-    except Exception as exc:
-        logger.warning("Edge Impulse model not available for verification: %s", exc)
-        return False
-
-
-def get_palm_confidence(roi_bgr: np.ndarray) -> float:
-    """
-    Get palm detection confidence score using Edge Impulse model.
-    
-    Args:
-        roi_bgr: Preprocessed palm ROI (96x96 grayscale)
-        
-    Returns:
-        Confidence score (0.0 to 1.0), or -1.0 if model not available
-    """
-    try:
-        from model_wrapper import get_model
-        
-        model = get_model()
-        if model.is_initialized:
-            # ROI should already be preprocessed by detector
-            scores, predicted_class = model.predict(roi_bgr)
-            return float(scores[1])  # "palm" class score
-        else:
-            logger.warning("Edge Impulse model not initialized, cannot get confidence")
-            return -1.0
-    except Exception as exc:
-        logger.warning("Edge Impulse model not available for confidence scoring: %s", exc)
-        return -1.0
+    verifier = PalmVerifier(feature_type=feature_type)
+    return verifier.verify_palm(palm_crops, handedness, match_threshold)

@@ -20,7 +20,8 @@ if 'QT_QPA_PLATFORM' not in os.environ:
 import argparse
 import logging
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, Any, Dict
+from collections import deque
 
 import cv2
 import numpy as np
@@ -28,9 +29,9 @@ import time
 import sys
 
 from camera import VideoCapture
-from detector import PalmDetector, DetectionResult
-from registration import register_user, verify_palm_for_registration
-from verification import verify_palm
+from detector import PalmDetector
+from registration import register_user_with_features, verify_palm_for_registration
+from verification import verify_palm_with_features
 
 
 @dataclass
@@ -44,13 +45,10 @@ class AppConfig:
     camera_buffer_size: Optional[int] = None
     cv2_threads: Optional[int] = None
     # Detector settings
-    max_hands: int = 1  # Focus on single hand
-    detection_confidence: float = 0.3  # Lower for better detection
-    tracking_confidence: float = 0.3   # Lower for better tracking
-    palm_threshold: float = 0.1        # Much lower for palm validation
-    # Palm verification settings
-    enforce_handedness: bool = True
-    mirror_correction: bool = True
+    palm_threshold: float = 0.8        # stricter default for validation
+    detection_confidence: float = 0.6
+    tracking_confidence: float = 0.6
+    smoothing_window: int = 5
     # ESP32 communication
     esp32_enabled: bool = False  # Enable ESP32 communication
     esp32_port: Optional[str] = None  # Serial port for ESP32
@@ -66,102 +64,6 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
-def get_hand_side_selection() -> str:
-    """Get hand side selection from user."""
-    while True:
-        try:
-            print("\n" + "="*50)
-            print("PALM REGISTRATION - HAND SIDE SELECTION")
-            print("="*50)
-            print("Which hand would you like to register?")
-            print("1. Left hand")
-            print("2. Right hand")
-            print("="*50)
-            
-            choice = input("Enter your choice (1 or 2): ").strip()
-            
-            if choice == "1":
-                return "Left"
-            elif choice == "2":
-                return "Right"
-            else:
-                print("Invalid choice. Please enter 1 for Left hand or 2 for Right hand.")
-        except KeyboardInterrupt:
-            print("\nRegistration cancelled by user.")
-            return None
-        except Exception:
-            print("Invalid input. Please try again.")
-
-
-def get_user_name() -> str:
-    """Get user name from terminal input."""
-    while True:
-        try:
-            print("\n" + "="*50)
-            print("REGISTRATION SUCCESSFUL!")
-            print("="*50)
-            name = input("Please enter your name: ").strip()
-            
-            if name:
-                return name
-            else:
-                print("Name cannot be empty. Please enter a valid name.")
-        except KeyboardInterrupt:
-            print("\nUsing default name 'Unknown'.")
-            return "Unknown"
-        except Exception:
-            print("Invalid input. Please try again.")
-
-
-def get_manual_handedness(detected_handedness: Optional[str]) -> str:
-    """Get manual handedness correction from user."""
-    while True:
-        try:
-            print("\n" + "="*50)
-            print("HANDEDNESS DETECTION")
-            print("="*50)
-            if detected_handedness:
-                print(f"MediaPipe detected: {detected_handedness} hand")
-                print("Is this correct?")
-            else:
-                print("MediaPipe could not detect handedness")
-                print("Which hand are you showing?")
-            print("1. Left hand")
-            print("2. Right hand")
-            print("="*50)
-            
-            choice = input("Enter your choice (1 or 2): ").strip()
-            
-            if choice == "1":
-                return "Left"
-            elif choice == "2":
-                return "Right"
-            else:
-                print("Invalid choice. Please enter 1 for Left hand or 2 for Right hand.")
-        except KeyboardInterrupt:
-            print("\nUsing detected handedness or default.")
-            return detected_handedness or "Right"
-        except Exception:
-            print("Invalid input. Please try again.")
-
-
-def correct_handedness_for_mirror(handedness: Optional[str]) -> Optional[str]:
-    """Correct handedness for camera mirroring.
-    
-    Camera feeds are typically mirrored, so MediaPipe's handedness detection
-    gets reversed. This function corrects that.
-    """
-    if handedness is None:
-        return None
-    
-    if handedness == "Left":
-        return "Right"
-    elif handedness == "Right":
-        return "Left"
-    else:
-        return handedness
-
-
 def parse_args() -> AppConfig:
     parser = argparse.ArgumentParser(description="Touchless Lock System - Palm Detection & Verification")
     parser.add_argument("--source", default="0", help="Camera index (e.g., 0) or stream URL")
@@ -169,16 +71,12 @@ def parse_args() -> AppConfig:
     parser.add_argument("--height", type=int, default=None, help="Desired frame height")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     parser.add_argument("--max-fps", type=float, default=30.0, help="Limit processing FPS (e.g., 15, 30). Use 0 or negative for unlimited")
-    parser.add_argument("--max-hands", type=int, default=1, help="Maximum number of hands to detect")
-    parser.add_argument("--detection-confidence", type=float, default=0.3, help="MediaPipe detection confidence threshold")
-    parser.add_argument("--tracking-confidence", type=float, default=0.3, help="MediaPipe tracking confidence threshold")
-    parser.add_argument("--palm-threshold", type=float, default=0.1, help="Edge Impulse palm validation threshold")
+    parser.add_argument("--palm-threshold", type=float, default=0.8, help="TFLite palm validation threshold (0..1)")
+    parser.add_argument("--detection-confidence", type=float, default=0.6, help="MediaPipe detection confidence")
+    parser.add_argument("--tracking-confidence", type=float, default=0.6, help="MediaPipe tracking confidence")
+    parser.add_argument("--smoothing-window", type=int, default=5, help="Smoothing window size for TFLite scores")
     parser.add_argument("--camera-buffer-size", type=int, default=None, help="Camera buffer size")
     parser.add_argument("--cv2-threads", type=int, default=None, help="OpenCV thread count")
-    parser.add_argument("--enforce-handedness", action="store_true", default=True, help="Enforce handedness matching during verification")
-    parser.add_argument("--no-enforce-handedness", action="store_false", dest="enforce_handedness", help="Disable handedness matching")
-    parser.add_argument("--mirror-correction", action="store_true", default=True, help="Correct handedness for camera mirroring")
-    parser.add_argument("--no-mirror-correction", action="store_false", dest="mirror_correction", help="Disable mirror correction")
     parser.add_argument("--esp32-enabled", action="store_true", help="Enable ESP32 communication")
     parser.add_argument("--esp32-port", type=str, default=None, help="ESP32 serial port (e.g., /dev/ttyUSB0)")
     try:
@@ -213,15 +111,105 @@ def parse_args() -> AppConfig:
         display=getattr(args, "display", True),
         camera_buffer_size=args.camera_buffer_size,
         cv2_threads=args.cv2_threads,
-        max_hands=int(args.max_hands),
+        palm_threshold=float(args.palm_threshold),
         detection_confidence=float(args.detection_confidence),
         tracking_confidence=float(args.tracking_confidence),
-        palm_threshold=float(args.palm_threshold),
-        enforce_handedness=getattr(args, "enforce_handedness", True),
-        mirror_correction=getattr(args, "mirror_correction", True),
+        smoothing_window=int(args.smoothing_window),
         esp32_enabled=getattr(args, "esp32_enabled", False),
         esp32_port=args.esp32_port,
     )
+
+
+def normalize_detection(det: Any, frame: np.ndarray) -> Dict[str, Any]:
+    """
+    Normalize detection to a dict with keys:
+      - bbox: (x, y, w, h)
+      - palm_roi: cropped ROI (grayscale) or None
+      - is_valid_palm: bool
+      - score: float or None
+      - handedness: Optional[str]
+    Supports input as dataclass-like object with attributes, or dict.
+    """
+    # helper accessors
+    def a(obj, key, default=None):
+        # try attribute then item
+        if hasattr(obj, key):
+            return getattr(obj, key)
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return default
+
+    bbox = a(det, "bbox", a(det, "box", None))
+    # bbox could be (x,y,w,h) or (x_min,y_min,x_max,y_max)
+    palm_roi = a(det, "palm_roi", None)
+    is_valid = a(det, "is_valid_palm", a(det, "is_palm", False))
+    score = a(det, "tflite_score", a(det, "score", a(det, "confidence", None)))
+    handedness = a(det, "handedness", None)
+
+    # normalize bbox to (x,y,w,h)
+    if bbox is None:
+        # fallback - try keys in dict
+        if isinstance(det, dict):
+            bbox = det.get("bbox") or det.get("box") or det.get("rect")
+    if bbox is None:
+        return {"bbox": None, "palm_roi": None, "is_valid_palm": is_valid, "score": score, "handedness": handedness}
+
+    # convert bbox tuple to (x,y,w,h)
+    if len(bbox) == 4:
+        x0, y0, a1, a2 = bbox
+        # Heuristic: if values look like x_min,y_min,x_max,y_max convert, else keep as x,y,w,h
+        if a1 > frame.shape[1] or a2 > frame.shape[0] or (a1 > a2 and (a1 - x0) > 0 and (a2 - y0) > 0 and a1 > x0 and a2 > y0):
+            # ambiguous, but assume (x_min, y_min, x_max, y_max) if a1, a2 greater than typical width/height
+            w = a1 - x0
+            h = a2 - y0
+            bbox_norm = (int(x0), int(y0), int(w), int(h))
+        else:
+            # treat as x,y,w,h
+            bbox_norm = (int(x0), int(y0), int(a1), int(a2))
+    else:
+        # unexpected, return
+        return {"bbox": None, "palm_roi": None, "is_valid_palm": is_valid, "score": score, "handedness": handedness}
+
+    # If palm_roi missing, crop from frame (grayscale)
+    if palm_roi is None and bbox_norm[2] > 0 and bbox_norm[3] > 0:
+        x, y, w, h = bbox_norm
+        x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+        try:
+            crop = frame[y:y2, x:x2]
+            if crop is None or crop.size == 0:
+                palm_roi = None
+            else:
+                # convert to grayscale to be consistent with TFLite preprocessing
+                if crop.ndim == 3 and crop.shape[2] == 3:
+                    palm_roi = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                else:
+                    palm_roi = crop.copy()
+        except Exception:
+            palm_roi = None
+
+    return {"bbox": bbox_norm, "palm_roi": palm_roi, "is_valid_palm": bool(is_valid), "score": float(score) if score is not None else None, "handedness": handedness}
+
+
+def print_status(message: str) -> None:
+    """Print status message to console inline."""
+    try:
+        sys.stdout.write(f"\r{message}")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def send_esp32_signal(unlock: bool, config: AppConfig, logger: logging.Logger) -> None:
+    """Send unlock/lock signal to ESP32 (stub)."""
+    if not config.esp32_enabled:
+        return
+    try:
+        signal = "UNLOCK" if unlock else "LOCK"
+        logger.info(f"ESP32 Signal: {signal}")
+        print_status(f"ESP32 Signal: {signal}")
+        # TODO: implement serial/MQTT/HTTP to ESP32
+    except Exception as exc:
+        logger.error(f"Failed to send ESP32 signal: {exc}")
 
 
 def main() -> None:
@@ -237,21 +225,24 @@ def main() -> None:
     except Exception:
         pass
 
-    # Initialize camera
-    cap = VideoCapture(source=config.source, width=config.width, height=config.height, buffer_size=config.camera_buffer_size)
+    # Initialize palm detector
+    detector = PalmDetector(
+        model_path="model/tflite-model/tflite_learn_781277_3.tflite",
+        max_num_hands=2,
+        detection_confidence=config.detection_confidence,
+        tracking_confidence=config.tracking_confidence,
+        palm_threshold=config.palm_threshold,
+        smoothing_window=config.smoothing_window
+    )
+
+    # Initialize camera with palm detector
+    cap = VideoCapture(source=config.source, width=config.width, height=config.height, 
+                      buffer_size=config.camera_buffer_size, detector=detector)
     try:
         cap.open()
     except Exception as exc:
         logger.error("Could not open video source: %s", exc)
         return
-
-    # Initialize palm detector
-    detector = PalmDetector(
-        max_num_hands=config.max_hands,
-        detection_confidence=config.detection_confidence,
-        tracking_confidence=config.tracking_confidence,
-        palm_threshold=config.palm_threshold,
-    )
 
     # Setup display window
     window_name = "Touchless Lock System"
@@ -276,112 +267,62 @@ def main() -> None:
     verification_targets: int = 5
     verification_cooldown: Optional[float] = None
 
-    def print_status(message: str) -> None:
-        """Print status message to console."""
-        try:
-            sys.stdout.write(f"\r{message}")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-    def send_esp32_signal(unlock: bool) -> None:
-        """Send unlock/lock signal to ESP32."""
-        if not config.esp32_enabled:
-            return
-        
-        try:
-            # TODO: Implement ESP32 communication (serial/MQTT/HTTP)
-            signal = "UNLOCK" if unlock else "LOCK"
-            logger.info(f"ESP32 Signal: {signal}")
-            print_status(f"ESP32 Signal: {signal}")
-        except Exception as exc:
-            logger.error(f"Failed to send ESP32 signal: {exc}")
-
+    frame_index: int = 0
     try:
-        frame_index: int = 0
         while True:
             frame_start = time.perf_counter()
             frame_index += 1
             
-            # Read frame from camera
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                logger.warning("No frame received from source.")
-                break
-
             # Check verification cooldown
             now = time.time()
             if verification_cooldown is not None and now < verification_cooldown:
                 remaining = verification_cooldown - now
                 status_text = f"Cooldown: {remaining:.1f}s remaining"
-                annotated = frame.copy()
-                detections = []
-                valid_detections = []
+                success, annotated, palm_crops = cap.get_palm_frame()
+                if not success:
+                    logger.warning("No frame received from source.")
+                    break
             else:
-                # Run palm detection and validation
-                annotated, detections = detector.detect(frame)
-                
-                # Process valid palm detections
-                valid_detections = [d for d in detections if d.is_valid_palm and d.palm_roi is not None]
+                # Get frame with palm detection
+                success, annotated, palm_crops = cap.get_palm_frame()
+                if not success:
+                    logger.warning("No frame received from source.")
+                    break
                 
                 # Log detection results
-                if detections:
-                    logger.info("Frame %d: %d total detections, %d valid palms", 
-                               frame_index, len(detections), len(valid_detections))
-                    for i, det in enumerate(detections):
-                        logger.info("  Detection %d: bbox=%s, handedness=%s, score=%.3f, valid_palm=%s", 
-                                   i, det.bbox, det.handedness, det.score, det.is_valid_palm)
+                if palm_crops:
+                    logger.info("Frame %d: %d valid palm crops detected", frame_index, len(palm_crops))
             
             if registering:
                 # Registration mode
-                if valid_detections:
-                    detection = valid_detections[0]  # Use first valid detection
-                    
-                    # Apply mirror correction for handedness
-                    raw_handedness = detection.handedness
-                    if config.mirror_correction:
-                        handedness = correct_handedness_for_mirror(raw_handedness)
-                    else:
-                        handedness = raw_handedness
-                    
-                    # Store handedness on first detection
-                    if registration_handedness is None:
-                        registration_handedness = handedness or "Right"
+                if palm_crops:
+                    # Use first palm crop
+                    palm_crop = palm_crops[0]
                     
                     # Add to registration snapshots
-                    registration_snapshots.append(detection.palm_roi)
+                    registration_snapshots.append(palm_crop)
                     status_text = f"Registration: {len(registration_snapshots)}/{registration_targets} snapshots"
                     
                     if len(registration_snapshots) >= registration_targets:
                         # Complete registration
                         try:
-                            # Verify all snapshots are valid palms
-                            all_valid = all(verify_palm_for_registration(roi) for roi in registration_snapshots)
+                            # Get user name
+                            user_name = input("\nRegistration complete! Enter your name: ").strip() or "Unknown"
                             
-                            if all_valid:
-                                # Extract embeddings and register user
-                                from registration import extract_embedding
-                                embeddings = [extract_embedding(roi) for roi in registration_snapshots]
-                                
-                                # Generate user ID
-                                import secrets
-                                user_id = "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(8))
-                                
-                                # Get user name
-                                user_name = input("\nRegistration complete! Enter your name: ").strip() or "Unknown"
-                                
-                                # Register user
-                                success = register_user(user_id, embeddings, registration_handedness, user_name)
-                                
-                                if success:
-                                    status_text = f"Registration successful for {user_name}!"
-                                    print_status(f"Registration successful for {user_name} ({registration_handedness} hand)")
-                                else:
-                                    status_text = "Registration failed - duplicate user or DB error"
-                                    print_status("Registration failed")
+                            # Register user with features
+                            success, user_id = register_user_with_features(
+                                registration_snapshots, 
+                                handedness=registration_handedness or "Right",
+                                name=user_name,
+                                feature_type="ORB"
+                            )
+                            
+                            if success:
+                                status_text = f"Registration successful for {user_name}!"
+                                print_status(f"Registration successful for {user_name} ({registration_handedness or 'Right'} hand)!")
                             else:
-                                status_text = "Registration failed - invalid palm detected"
-                                print_status("Registration failed - invalid palm")
+                                status_text = "Registration failed - error occurred"
+                                print_status("Registration failed")
                         except Exception as exc:
                             logger.error(f"Registration error: {exc}")
                             status_text = "Registration failed - error occurred"
@@ -394,39 +335,34 @@ def main() -> None:
                         
             else:
                 # Verification mode
-                if valid_detections:
-                    detection = valid_detections[0]  # Use first valid detection
-                    
-                    # Apply mirror correction for handedness
-                    raw_handedness = detection.handedness
-                    if config.mirror_correction:
-                        handedness = correct_handedness_for_mirror(raw_handedness)
-                    else:
-                        handedness = raw_handedness
+                if palm_crops:
+                    # Use first palm crop
+                    palm_crop = palm_crops[0]
                     
                     # Add to verification snapshots
-                    verification_snapshots.append(detection.palm_roi)
+                    verification_snapshots.append(palm_crop)
                     status_text = f"Verification: {len(verification_snapshots)}/{verification_targets} snapshots"
                     
                     if len(verification_snapshots) >= verification_targets:
                         # Complete verification
                         try:
-                            # Extract embeddings and verify
-                            from registration import extract_embedding
-                            embeddings = [extract_embedding(roi) for roi in verification_snapshots]
-                            
-                            # Verify against database
-                            is_match, matched_user, matched_name = verify_palm(embeddings, handedness=handedness if config.enforce_handedness else None)
+                            # Verify against database using feature matching
+                            is_match, matched_user_id, matched_name = verify_palm_with_features(
+                                verification_snapshots,
+                                handedness=None,  # Check both hands
+                                feature_type="ORB",
+                                match_threshold=0.15
+                            )
                             
                             if is_match:
-                                display_name = matched_name if matched_name and matched_name != "Unknown" else matched_user
+                                display_name = matched_name if matched_name and matched_name != "Unknown" else f"User {matched_user_id}"
                                 status_text = f"Access Granted: {display_name}"
                                 print_status(f"Access Granted: {display_name}")
-                                send_esp32_signal(True)  # Send unlock signal
+                                send_esp32_signal(True, config, logger)  # Send unlock signal
                             else:
                                 status_text = "Access Denied"
                                 print_status("Access Denied")
-                                send_esp32_signal(False)  # Send lock signal
+                                send_esp32_signal(False, config, logger)  # Send lock signal
                                 
                         except Exception as exc:
                             logger.error(f"Verification error: {exc}")
@@ -443,6 +379,11 @@ def main() -> None:
 
             # Display frame and handle input
             if config.display:
+                # add status overlay in top-left
+                try:
+                    cv2.putText(annotated, status_text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                except Exception:
+                    pass
                 cv2.imshow(window_name, annotated)
                 key = cv2.waitKey(1) & 0xFF
             else:
@@ -486,8 +427,16 @@ def main() -> None:
         except Exception:
             pass
         
-        detector.close()
-        cap.release()
+        try:
+            if 'detector' in locals():
+                detector.close()
+        except Exception:
+            pass
+
+        try:
+            cap.release()
+        except Exception:
+            pass
         
         if config.display:
             cv2.destroyAllWindows()

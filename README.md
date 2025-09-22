@@ -1,22 +1,21 @@
 # TLS Palm Recognition System
 
-A robust, real-time palm recognition system built with Python, OpenCV, MediaPipe Hands, and Edge Impulse. This system provides secure palm-based authentication with advanced features including handedness detection, palm orientation normalization, and strict verification protocols.
+A robust, real-time palm recognition system built with Python, OpenCV, and TensorFlow Lite. This system provides secure palm-based authentication with advanced features including computer vision-based detection, palm orientation normalization, and strict verification protocols.
 
 ## 🚀 Features
 
 ### Core Capabilities
-- **Real-time Palm Detection**: Uses MediaPipe Hands for accurate hand tracking and landmark detection
-- **Edge Impulse Integration**: Advanced palm verification using trained TensorFlow Lite models
-- **Handedness-Aware Recognition**: Separate registration and verification for left and right hands
+- **Real-time Palm Detection**: Uses computer vision techniques for accurate hand region detection
+- **TensorFlow Lite Integration**: Advanced palm verification using trained TFLite models
+- **Universal Palm Recognition**: Works with any hand orientation
 - **Palm Orientation Normalization**: Consistent palm orientation for improved recognition accuracy
 - **Strict Verification Protocols**: High-precision matching with variance checking
 - **Robust Registration Process**: 15-snapshot registration with hand side selection and name collection
 - **SQLite Database**: Persistent storage with automatic schema migration
 
 ### Advanced Features
-- **Hybrid Detection Pipeline**: MediaPipe for fast detection + Edge Impulse for palm verification
+- **Computer Vision Pipeline**: Thresholding and contour detection + TFLite for palm verification
 - **Configurable Thresholds**: Adjustable similarity and variance parameters
-- **Handedness Enforcement**: Toggleable left/right hand matching
 - **Palm-Only Mode**: Filters to open palm detections only (default)
 - **Palm Region Focus**: Extracts palm-only regions excluding fingers (default)
 - **ESP32 Ready**: Communication framework for hardware deployment
@@ -25,7 +24,7 @@ A robust, real-time palm recognition system built with Python, OpenCV, MediaPipe
 
 - Python 3.8+
 - OpenCV 4.7+
-- MediaPipe 0.10.14
+- TensorFlow 2.17.1
 - NumPy 1.26+
 - scikit-image 0.19.0+
 
@@ -83,7 +82,7 @@ python main.py
 
 #### Detection Settings
 ```bash
---backend {mediapipe,edgeimpulse}  # Detection backend (default: mediapipe)
+--palm-threshold THRESHOLD        # TFLite palm validation threshold (default: 0.1)
 --source SOURCE                    # Camera index or stream URL (default: 0)
 --width WIDTH                      # Desired frame width
 --height HEIGHT                    # Desired frame height
@@ -102,18 +101,11 @@ python main.py
 --cv2-threads N                   # Set OpenCV thread count
 ```
 
-#### MediaPipe Settings
+#### Computer Vision Settings
 ```bash
---mp-max-hands N                  # Maximum number of hands to detect (default: 2)
---mp-det-conf CONF                # Minimum detection confidence (default: 0.5)
---mp-track-conf CONF              # Minimum tracking confidence (default: 0.5)
+--palm-threshold FLOAT            # Palm validation threshold (default: 0.1)
 ```
 
-#### Verification Settings
-```bash
---enforce-handedness              # Enforce handedness matching during verification (default: enabled)
---no-enforce-handedness           # Disable handedness matching during verification
-```
 
 #### System Settings
 ```bash
@@ -151,7 +143,7 @@ python main.py --no-palm-only --no-palm-region-only
 ```
 main.py              # Main application entry point
 ├── camera.py        # Video capture abstraction
-├── detector.py      # Palm detection backends (MediaPipe/Edge Impulse)
+├── detector.py      # Palm detection using computer vision + TFLite
 ├── registration.py  # Palm registration and embedding extraction
 ├── verification.py  # Palm verification and matching
 ├── model_wrapper.py # Edge Impulse model interface
@@ -165,9 +157,9 @@ main.py              # Main application entry point
 
 ### Edge Impulse Integration
 
-The system uses a **hybrid approach** combining:
-- **MediaPipe Hands** for fast hand detection and ROI extraction
-- **Edge Impulse C++ model** for palm verification and recognition
+The system uses a **computer vision approach** combining:
+- **OpenCV thresholding and contour detection** for fast hand region detection
+- **TensorFlow Lite model** for palm verification and recognition
 
 #### Model Specifications
 - **Input**: 96x96 grayscale images
@@ -180,11 +172,9 @@ The system uses a **hybrid approach** combining:
 
 ```sql
 CREATE TABLE registered_palms (
-    user_id TEXT,
-    handedness TEXT,
+    user_id TEXT PRIMARY KEY,
     name TEXT,
-    embeddings BLOB NOT NULL,
-    PRIMARY KEY (user_id, handedness)
+    embeddings BLOB NOT NULL
 );
 ```
 
@@ -195,10 +185,6 @@ CREATE TABLE registered_palms (
 - **`--palm-region-only`**: Extracts palm-only bounding boxes excluding fingers
 - **Impact**: Improves recognition accuracy by focusing on palm features rather than finger positions
 
-#### Handedness Detection
-- **Automatic Detection**: Uses MediaPipe's handedness classification
-- **Separate Storage**: Left and right hands stored independently
-- **Verification Filtering**: Only compares against same-handedness registrations
 
 #### Palm Normalization
 - **Orientation Correction**: Uses wrist-to-middle-finger-MCP vector for consistent orientation
@@ -234,9 +220,9 @@ def extract_embedding(roi_bgr: np.ndarray) -> np.ndarray:
 
 ### Database Migration
 
-The system automatically migrates existing databases to support handedness:
+The system automatically migrates existing databases to remove handedness:
 
-- **Existing Users**: Automatically marked as "Right" handedness
+- **Existing Users**: Keeps first occurrence of each user_id
 - **Schema Updates**: Handled transparently on first run
 - **Backward Compatibility**: Preserves all existing data
 
