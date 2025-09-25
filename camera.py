@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 from typing import Optional, Tuple, Union, List
+import os
+import time
 
 import cv2
 import numpy as np
@@ -31,13 +33,16 @@ class VideoCapture:
 
     def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, 
                  height: Optional[int] = None, buffer_size: Optional[int] = None,
-                 detector: Optional[PalmDetector] = None) -> None:
+                 detector: Optional[PalmDetector] = None,
+                 save_snaps: bool = False, snaps_dir: Optional[str] = None) -> None:
         self.source: Union[int, str] = source
         self.width: Optional[int] = width
         self.height: Optional[int] = height
         self.buffer_size: Optional[int] = buffer_size
         self.detector: Optional[PalmDetector] = detector
         self._cap: Optional[cv2.VideoCapture] = None
+        self.save_snaps: bool = save_snaps
+        self.snaps_dir: str = snaps_dir or "snapshots"
 
     def open(self) -> None:
         """Open the video source and apply optional resolution settings."""
@@ -94,8 +99,32 @@ class VideoCapture:
             # Run palm detection
             annotated_frame, detections = self.detector.detect(frame)
             
-            # Extract palm crops from valid detections
-            palm_crops = [det.palm_roi for det in detections if det.is_valid_palm]
+            # Extract palm crops (detector now outputs candidates without TFLite gating)
+            palm_crops = [det.palm_roi for det in detections]
+
+            # Optionally save snapshots of each detection (original ROI and 96x96)
+            if self.save_snaps and detections:
+                try:
+                    os.makedirs(self.snaps_dir, exist_ok=True)
+                    ts_ms = int(time.time() * 1000)
+                    for idx, det in enumerate(detections):
+                        x, y, w, h = det.bbox
+                        x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+                        orig_roi = frame[y:y2, x:x2]
+                        hand = det.handedness or "Unknown"
+                        base = f"{ts_ms}_{idx}_{hand}"
+                        # Save original ROI (BGR)
+                        try:
+                            cv2.imwrite(os.path.join(self.snaps_dir, f"roi_{base}.png"), orig_roi)
+                        except Exception:
+                            logger.debug("Failed to save original ROI snapshot")
+                        # Save 96x96 grayscale
+                        try:
+                            cv2.imwrite(os.path.join(self.snaps_dir, f"roi96_{base}.png"), det.palm_roi)
+                        except Exception:
+                            logger.debug("Failed to save 96x96 ROI snapshot")
+                except Exception:
+                    logger.debug("Snapshot saving failed")
             
             return True, annotated_frame, palm_crops
             

@@ -1,7 +1,9 @@
-"""Palm verification module using feature matching.
+"""Palm verification module: TFLite palm gating + biometric matching.
 
-Compares live palm features with stored templates using ORB/SIFT/SURF features.
-Uses ratio test (Lowe's 0.75) and RANSAC homography for robust matching.
+Flow:
+1) Edge Impulse TFLite int8 classification (palm vs not palm)
+2) If palm -> extract deep crease skeleton via shared preprocessing
+3) Match features/structures vs registered templates
 """
 from __future__ import annotations
 
@@ -12,6 +14,41 @@ import numpy as np
 
 from db import get_all_templates, get_user_name
 from registration import PalmFeatureExtractor
+from preprocessing import preprocess_palm
+import tensorflow as tf
+
+
+class TFLitePalmClassifier:
+    """Edge Impulse TFLite int8 classifier wrapper."""
+
+    def __init__(self, model_path: str = "model/tflite-model/tflite_learn_781277_3.tflite") -> None:
+        self.model_path = model_path
+        self._load()
+
+    def _load(self) -> None:
+        self.interpreter = tf.lite.Interpreter(model_path=self.model_path)
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+
+        self.input_index = self.input_details[0]["index"]
+        self.output_index = self.output_details[0]["index"]
+
+    def _to_int8_input(self, gray_96: np.ndarray) -> np.ndarray:
+        # Expect uint8 grayscale 96x96 → int8 centered
+        roi_norm = gray_96.astype(np.float32) / 255.0
+        roi_int8 = ((roi_norm - 0.5) * 255).astype(np.int8)
+        return np.expand_dims(roi_int8, axis=(0, -1))
+
+    def infer(self, gray_96: np.ndarray) -> Tuple[bool, float]:
+        input_tensor = self._to_int8_input(gray_96)
+        self.interpreter.set_tensor(self.input_index, input_tensor)
+        self.interpreter.invoke()
+        output_data = self.interpreter.get_tensor(self.output_index)[0]
+        pred_index = int(np.argmax(output_data))
+        confidence = float(output_data[pred_index]) / 128.0
+        is_palm = (pred_index == 1)
+        return is_palm, confidence
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +74,8 @@ class PalmVerifier:
         
         # Initialize feature extractor
         self.extractor = PalmFeatureExtractor(feature_type=feature_type)
+        # Initialize classifier for gating
+        self.classifier = TFLitePalmClassifier()
         
         # Initialize matcher based on feature type
         self._init_matcher()
@@ -155,7 +194,7 @@ class PalmVerifier:
             return 0, 0.0
     
     def verify_palm(self, palm_crops: Sequence[np.ndarray], handedness: Optional[str] = None,
-                   match_threshold: float = 0.15) -> Tuple[bool, Optional[int], Optional[str]]:
+                   match_threshold: float = 0.15, palm_threshold: float = 0.8) -> Tuple[bool, Optional[int], Optional[str]]:
         """
         Verify palm against stored templates.
         
@@ -171,10 +210,18 @@ class PalmVerifier:
             return False, None, None
         
         try:
-            # Extract features from live palm crops
+            # Gate by TFLite palm classifier and extract features from live palm crops
             live_features = []
             for crop in palm_crops:
-                keypoints, descriptors = self.extractor.extract_features(crop)
+                # crop is 96x96 grayscale. Run EI TFLite gate first
+                is_palm, conf = self.classifier.infer(crop)
+                logger.info("TFLite palm gate: is_palm=%s conf=%.2f", str(is_palm), conf)
+                if not is_palm or conf < palm_threshold:
+                    continue
+
+                # Apply biometric crease preprocessing for reproducibility
+                crease = preprocess_palm(crop)
+                keypoints, descriptors = self.extractor.extract_features(crease)
                 if descriptors is not None and len(descriptors) > 0:
                     live_features.append((keypoints, descriptors))
             

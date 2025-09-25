@@ -52,6 +52,9 @@ class AppConfig:
     # ESP32 communication
     esp32_enabled: bool = False  # Enable ESP32 communication
     esp32_port: Optional[str] = None  # Serial port for ESP32
+    # Snapshots
+    save_snaps: bool = False
+    snaps_dir: Optional[str] = "snapshots"
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -79,6 +82,8 @@ def parse_args() -> AppConfig:
     parser.add_argument("--cv2-threads", type=int, default=None, help="OpenCV thread count")
     parser.add_argument("--esp32-enabled", action="store_true", help="Enable ESP32 communication")
     parser.add_argument("--esp32-port", type=str, default=None, help="ESP32 serial port (e.g., /dev/ttyUSB0)")
+    parser.add_argument("--save-snaps", action="store_true", help="Save detected palm snapshots to disk")
+    parser.add_argument("--snaps-dir", type=str, default="snapshots", help="Directory to save snapshots")
     try:
         bool_action = argparse.BooleanOptionalAction  # Python 3.9+
         parser.add_argument("--display", action=bool_action, default=True, help="Show window and accept hotkeys")
@@ -117,6 +122,8 @@ def parse_args() -> AppConfig:
         smoothing_window=int(args.smoothing_window),
         esp32_enabled=getattr(args, "esp32_enabled", False),
         esp32_port=args.esp32_port,
+        save_snaps=getattr(args, "save_snaps", False),
+        snaps_dir=getattr(args, "snaps_dir", "snapshots"),
     )
 
 
@@ -227,7 +234,7 @@ def main() -> None:
 
     # Initialize palm detector
     detector = PalmDetector(
-        model_path="model/tflite-model/tflite_learn_781277_3.tflite",
+        model_path=None,
         max_num_hands=2,
         detection_confidence=config.detection_confidence,
         tracking_confidence=config.tracking_confidence,
@@ -237,7 +244,8 @@ def main() -> None:
 
     # Initialize camera with palm detector
     cap = VideoCapture(source=config.source, width=config.width, height=config.height, 
-                      buffer_size=config.camera_buffer_size, detector=detector)
+                      buffer_size=config.camera_buffer_size, detector=detector,
+                      save_snaps=config.save_snaps, snaps_dir=config.snaps_dir)
     try:
         cap.open()
     except Exception as exc:

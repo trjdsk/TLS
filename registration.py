@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from db import create_user, save_palm_template, get_user_templates, get_user_name
+from preprocessing import preprocess_palm
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +107,8 @@ class PalmFeatureExtractor:
         Returns:
             Tuple of (keypoints, descriptors)
         """
-        # Enhance palm creases
-        enhanced = self.enhance_palm_creases(palm_roi)
+        # Use shared biometric preprocessing for reproducibility
+        enhanced = preprocess_palm(palm_roi)
         
         # Extract features
         keypoints, descriptors = self.detector.detectAndCompute(enhanced, None)
@@ -182,7 +183,9 @@ def register_user_with_features(palm_crops: Sequence[np.ndarray], handedness: st
         # Extract features from all valid crops
         all_descriptors = []
         for crop in valid_crops:
-            keypoints, descriptors = extractor.extract_features(crop)
+            # Ensure reproducible preprocessing before feature extraction
+            crease = preprocess_palm(crop)
+            keypoints, descriptors = extractor.extract_features(crease)
             if descriptors is not None and len(descriptors) > 0:
                 all_descriptors.append(descriptors)
         

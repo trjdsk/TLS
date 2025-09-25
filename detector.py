@@ -1,24 +1,22 @@
-"""Palm detection module using MediaPipe + TFLite Edge Impulse model.
+"""Palm detection module using MediaPipe Hands.
 
 Provides PalmDetector class that:
-1. Uses MediaPipe Hands to find hand bounding boxes
-2. Crops ROI and resizes to 96x96x1 grayscale
-3. Normalizes and quantizes for INT8 TFLite model
-4. Runs Edge Impulse inference for palm classification
-5. Applies debouncing (must detect "palm" ≥3/5 frames)
-6. Returns annotated frame and palm crops
+1. Uses MediaPipe Hands to find palm bounding boxes (excludes fingers)
+2. Crops ROI and converts to 96x96 grayscale (no TFLite here)
+3. Returns annotated frame and palm crops for downstream processing
 """
 
 import cv2
 import numpy as np
 import mediapipe as mp
-import tensorflow as tf
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+from preprocessing import preprocess_roi_96
 
 
 @dataclass
@@ -32,9 +30,9 @@ class PalmDetection:
 
 
 class PalmDetector:
-    """Palm detector using MediaPipe + TFLite Edge Impulse model."""
+    """Palm detector using MediaPipe; produces palm-only crops."""
     
-    def __init__(self, model_path: str, max_num_hands: int = 2, 
+    def __init__(self, model_path: str | None = None, max_num_hands: int = 2, 
                  detection_confidence: float = 0.7, tracking_confidence: float = 0.6,
                  palm_threshold: float = 0.85, smoothing_window: int = 5):
         """
@@ -48,42 +46,15 @@ class PalmDetector:
             palm_threshold: TFLite palm classification threshold
             smoothing_window: Number of frames for confidence smoothing
         """
-        self.model_path = model_path
+        self.model_path = model_path  # kept for compatibility (unused here)
         self.palm_threshold = palm_threshold
         self.smoothing_window = smoothing_window
-        
-        # Load TFLite model
-        self._load_tflite_model()
         
         # Initialize MediaPipe
         self._init_mediapipe(max_num_hands, detection_confidence, tracking_confidence)
         
-        # Confidence history for debouncing
-        self.confidence_history = deque(maxlen=smoothing_window)
-        
-        logger.info("PalmDetector initialized with model: %s", model_path)
-    
-    def _load_tflite_model(self):
-        """Load and initialize TFLite model."""
-        try:
-            self.interpreter = tf.lite.Interpreter(model_path=self.model_path)
-            self.interpreter.allocate_tensors()
-            
-            self.input_details = self.interpreter.get_input_details()
-            self.output_details = self.interpreter.get_output_details()
-            
-            self.labels = ["not_palm", "palm"]
-            self.input_index = self.input_details[0]['index']
-            self.output_index = self.output_details[0]['index']
-            
-            # Expected input size: 96x96x1
-            self.INPUT_H, self.INPUT_W, self.INPUT_C = 96, 96, 1
-            
-            logger.info("TFLite model loaded successfully")
-            
-        except Exception as e:
-            logger.error("Failed to load TFLite model: %s", e)
-            raise
+        logger.info("PalmDetector initialized (MediaPipe only; downstream model handled elsewhere)")
+
     
     def _init_mediapipe(self, max_num_hands: int, detection_confidence: float, tracking_confidence: float):
         """Initialize MediaPipe hands detection."""
@@ -99,64 +70,61 @@ class PalmDetector:
         
         logger.info("MediaPipe hands initialized")
     
-    def _preprocess_roi(self, roi: np.ndarray) -> np.ndarray:
+    def _compute_palm_bbox(self, hand_landmarks, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+        """Compute a palm-only bounding box that includes full palm area while excluding fingers.
+
+        Strategy:
+        1. Use wrist (0) and palm base landmarks (1, 2, 5, 9, 13, 17) for palm outline
+        2. Add extra padding to ensure full palm coverage
+        3. Use palm center to determine if we need asymmetric padding
         """
-        Preprocess ROI for TFLite inference.
+        h, w, _ = frame_shape
         
-        Args:
-            roi: BGR image crop
-            
-        Returns:
-            Preprocessed input tensor [1, 96, 96, 1]
-        """
-        # Convert to grayscale
-        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # Palm landmarks: wrist + palm base + MCP joints (excluding finger tips)
+        palm_landmarks = [0, 1, 2, 5, 9, 13, 17]  # wrist, palm base, MCPs
         
-        # Lighting normalization (CLAHE for uneven lighting)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        roi_eq = clahe.apply(roi_gray)
+        # Get coordinates of palm landmarks
+        xs = [hand_landmarks.landmark[i].x * w for i in palm_landmarks]
+        ys = [hand_landmarks.landmark[i].y * h for i in palm_landmarks]
         
-        # Resize to 96x96
-        roi_resized = cv2.resize(roi_eq, (self.INPUT_W, self.INPUT_H))
+        # Calculate palm center for asymmetric padding
+        palm_center_x = np.mean(xs)
+        palm_center_y = np.mean(ys)
         
-        # Normalize to [-128, 127] range for int8 quantization
-        roi_norm = roi_resized.astype(np.float32) / 255.0  # [0,1]
-        roi_int8 = ((roi_norm - 0.5) * 255).astype(np.int8)  # center around 0
+        # Initial bounding box from palm landmarks
+        x_min, x_max = int(max(0, min(xs))), int(min(w, max(xs)))
+        y_min, y_max = int(max(0, min(ys))), int(min(h, max(ys)))
         
-        # Shape: [1,96,96,1]
-        input_data = np.expand_dims(roi_int8, axis=(0, -1))
-        return input_data
+        # Calculate palm dimensions for proportional padding
+        palm_width = x_max - x_min
+        palm_height = y_max - y_min
+        
+        # Add generous padding to ensure full palm coverage
+        # Use 20-25% of palm size as padding, with minimum of 15px
+        pad_x = max(15, int(palm_width * 0.25))
+        pad_y = max(15, int(palm_height * 0.25))
+        
+        # Apply padding
+        x_min = max(0, x_min - pad_x)
+        y_min = max(0, y_min - pad_y)
+        x_max = min(w, x_max + pad_x)
+        y_max = min(h, y_max + pad_y)
+        
+        # Ensure minimum size for palm detection
+        min_size = 40
+        if (x_max - x_min) < min_size:
+            center_x = (x_min + x_max) // 2
+            x_min = max(0, center_x - min_size // 2)
+            x_max = min(w, center_x + min_size // 2)
+        
+        if (y_max - y_min) < min_size:
+            center_y = (y_min + y_max) // 2
+            y_min = max(0, center_y - min_size // 2)
+            y_max = min(h, center_y + min_size // 2)
+
+        return x_min, y_min, x_max - x_min, y_max - y_min
     
-    def _run_tflite_inference(self, roi: np.ndarray) -> Tuple[bool, float]:
-        """
-        Run TFLite inference on palm ROI.
-        
-        Args:
-            roi: BGR image crop
-            
-        Returns:
-            Tuple of (is_palm, confidence_score)
-        """
-        try:
-            # Preprocess ROI
-            input_data = self._preprocess_roi(roi)
-            
-            # Run inference
-            self.interpreter.set_tensor(self.input_index, input_data)
-            self.interpreter.invoke()
-            output_data = self.interpreter.get_tensor(self.output_index)[0]
-            
-            # Get prediction
-            pred_index = int(np.argmax(output_data))
-            confidence = output_data[pred_index] / 128.0  # adjust scaling if needed
-            label = self.labels[pred_index]
-            
-            is_palm = (label == "palm" and confidence > self.palm_threshold)
-            return is_palm, confidence
-            
-        except Exception as e:
-            logger.error("TFLite inference failed: %s", e)
-            return False, 0.0
+    # TFLite inference removed from detector; handled in verification module
     
     def _get_handedness(self, hand_landmarks) -> str:
         """
@@ -197,62 +165,36 @@ class PalmDetector:
         
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                # Get bounding box from landmarks
-                h, w, _ = frame.shape
-                x_coords = [lm.x * w for lm in hand_landmarks.landmark]
-                y_coords = [lm.y * h for lm in hand_landmarks.landmark]
-                
-                x_min, x_max = int(min(x_coords)), int(max(x_coords))
-                y_min, y_max = int(min(y_coords)), int(max(y_coords))
-                
-                # Expand box slightly
-                pad = 20
-                x_min = max(0, x_min - pad)
-                y_min = max(0, y_min - pad)
-                x_max = min(w, x_max + pad)
-                y_max = min(h, y_max + pad)
-                
+                # Compute palm-only bounding box (exclude fingers)
+                x_min, y_min, w_box, h_box = self._compute_palm_bbox(hand_landmarks, frame.shape)
+                x_max, y_max = x_min + w_box, y_min + h_box
+
                 # Crop ROI
                 roi = frame[y_min:y_max, x_min:x_max]
                 if roi.size == 0:
                     continue
                 
-                # Run TFLite inference
-                is_palm, confidence = self._run_tflite_inference(roi)
-                
-                # Add confidence to history for debouncing
-                self.confidence_history.append(confidence)
-                
-                # Smooth confidence over last N frames
-                smoothed_conf = np.mean(self.confidence_history)
-                
-                # Apply debouncing: must detect "palm" ≥3/5 frames
-                palm_count = sum(1 for c in self.confidence_history if c > self.palm_threshold)
-                is_valid_palm = (palm_count >= 3) and is_palm
-                
+                # Preprocess to 96x96 grayscale (no model gating here)
+                roi_96 = preprocess_roi_96(roi)
+
                 # Get handedness
                 handedness = self._get_handedness(hand_landmarks)
                 
-                # Create palm crop (96x96 grayscale)
-                palm_roi = self._preprocess_roi(roi).squeeze()  # Remove batch and channel dims
+                palm_roi = roi_96
                 
                 # Create detection object
                 detection = PalmDetection(
-                    bbox=(x_min, y_min, x_max - x_min, y_max - y_min),
+                    bbox=(x_min, y_min, w_box, h_box),
                     palm_roi=palm_roi,
-                    is_valid_palm=is_valid_palm,
-                    tflite_score=smoothed_conf,
+                    is_valid_palm=True,  # gating deferred; mark as candidate
+                    tflite_score=0.0,
                     handedness=handedness
                 )
                 detections.append(detection)
                 
                 # Draw annotations
-                if is_valid_palm:
-                    color = (0, 255, 0)  # Green for valid palm
-                    label_text = f"Palm: {smoothed_conf:.2f}"
-                else:
-                    color = (0, 0, 255)  # Red for invalid/no palm
-                    label_text = f"Not Palm: {smoothed_conf:.2f}"
+                color = (0, 255, 0)
+                label_text = "Palm candidate"
                 
                 cv2.rectangle(annotated_frame, (x_min, y_min), (x_max, y_max), color, 2)
                 cv2.putText(annotated_frame, label_text, (x_min, y_min - 10), 
