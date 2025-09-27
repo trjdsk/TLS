@@ -77,15 +77,15 @@ class VideoCapture:
             logger.debug("Failed to read frame from source: %s", self.source)
         return ret, frame
 
-    def get_palm_frame(self) -> Tuple[bool, Optional[np.ndarray], List[np.ndarray]]:
+    def get_palm_frame(self) -> Tuple[bool, Optional[np.ndarray], List[PalmDetection]]:
         """
-        Get frame with palm detection and return annotated frame + palm crops.
+        Get frame with palm detection and return annotated frame + palm detections.
         
         Returns:
-            Tuple of (success, annotated_frame, palm_crops)
+            Tuple of (success, annotated_frame, palm_detections)
             - success: True if frame was read successfully
             - annotated_frame: Frame with palm bounding boxes and annotations
-            - palm_crops: List of 96x96 grayscale palm crops for processing
+            - palm_detections: List of PalmDetection objects with crops and landmarks
         """
         ret, frame = self.read()
         if not ret or frame is None:
@@ -98,9 +98,6 @@ class VideoCapture:
         try:
             # Run palm detection
             annotated_frame, detections = self.detector.detect(frame)
-            
-            # Extract palm crops (detector now outputs candidates without TFLite gating)
-            palm_crops = [det.palm_roi for det in detections]
 
             # Optionally save snapshots of each detection (original ROI and 96x96)
             if self.save_snaps and detections:
@@ -126,7 +123,7 @@ class VideoCapture:
                 except Exception:
                     logger.debug("Snapshot saving failed")
             
-            return True, annotated_frame, palm_crops
+            return True, annotated_frame, detections
             
         except Exception as e:
             logger.error("Palm detection failed: %s", e)
@@ -140,7 +137,7 @@ class VideoCapture:
             self._cap = None
 
 
-def get_palm_frame(cap: VideoCapture) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
+def get_palm_frame(cap: VideoCapture) -> Tuple[Optional[np.ndarray], List[PalmDetection]]:
     """
     Legacy function for backward compatibility.
     
@@ -148,11 +145,11 @@ def get_palm_frame(cap: VideoCapture) -> Tuple[Optional[np.ndarray], List[np.nda
         cap: VideoCapture instance with palm detector
         
     Returns:
-        Tuple of (annotated_frame, palm_crops)
+        Tuple of (annotated_frame, palm_detections)
     """
-    success, annotated_frame, palm_crops = cap.get_palm_frame()
+    success, annotated_frame, palm_detections = cap.get_palm_frame()
     if success:
-        return annotated_frame, palm_crops
+        return annotated_frame, palm_detections
     else:
         return None, []
 

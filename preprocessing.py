@@ -1,4 +1,7 @@
-"""Shared preprocessing utilities for palm detection and biometrics."""
+"""Shared preprocessing utilities for palm detection and biometrics.
+
+Provides basic image preprocessing functions for palm ROI normalization.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +10,6 @@ from typing import Tuple
 
 import cv2
 import numpy as np
-from skimage.morphology import skeletonize, remove_small_objects
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +36,13 @@ def preprocess_roi_96(roi_bgr: np.ndarray) -> np.ndarray:
 
 
 def preprocess_palm(img: np.ndarray) -> np.ndarray:
-    """Enhance only deep palm creases as binary (0/255) uint8 mask.
+    """Basic palm preprocessing with histogram equalization.
 
-    Steps: CLAHE -> Canny -> Morph Open/Close -> Skeletonize -> Remove small objects.
-    Falls back to Canny edges if result is empty.
+    Args:
+        img: Input palm image (96x96 grayscale)
+        
+    Returns:
+        Preprocessed palm image with histogram equalization
     """
     if img is None or img.size == 0:
         raise ValueError("Empty image provided to preprocess_palm")
@@ -45,25 +50,9 @@ def preprocess_palm(img: np.ndarray) -> np.ndarray:
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # CLAHE for contrast normalization
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-    img_eq = clahe.apply(img)
-
-    # Edge detection
-    edges = cv2.Canny(img_eq, 50, 120)
-
-    # Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opened = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel, iterations=1)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    # Skeletonize and remove small objects
-    skel = skeletonize(closed > 0)
-    cleaned = remove_small_objects(skel, min_size=20, connectivity=2)
-
-    if np.sum(cleaned) == 0:
-        cleaned = edges > 0
-
-    return (cleaned.astype(np.uint8) * 255)
+    # Apply histogram equalization for consistent lighting
+    equalized = cv2.equalizeHist(img)
+    
+    return equalized
 
 

@@ -2,16 +2,15 @@
 
 Provides PalmDetector class that:
 1. Uses MediaPipe Hands to find palm bounding boxes (excludes fingers)
-2. Crops ROI and converts to 96x96 grayscale (no TFLite here)
-3. Returns annotated frame and palm crops for downstream processing
+2. Crops ROI and converts to 96x96 grayscale with histogram equalization
+3. Returns annotated frame and palm crops with landmarks for feature extraction
 """
 
 import cv2
 import numpy as np
 import mediapipe as mp
-from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,42 +21,17 @@ from preprocessing import preprocess_roi_96
 @dataclass
 class PalmDetection:
     """Represents a detected palm with bounding box and metadata."""
-    bbox: Tuple[int, int, int, int]  # (x, y, w, h)
-    palm_roi: np.ndarray  # 96x96 grayscale palm crop
-    is_valid_palm: bool  # True if TFLite confirms palm
-    tflite_score: float  # TFLite confidence score
-    handedness: Optional[str] = None  # "Left" or "Right"
+    bbox: Tuple[int, int, int, int]
+    palm_roi: np.ndarray
+    landmarks: Any
+    handedness: Optional[str] = None
+    confidence: float = 1.0
 
 
 class PalmDetector:
     """Palm detector using MediaPipe; produces palm-only crops."""
     
-    def __init__(self, model_path: str | None = None, max_num_hands: int = 2, 
-                 detection_confidence: float = 0.7, tracking_confidence: float = 0.6,
-                 palm_threshold: float = 0.85, smoothing_window: int = 5):
-        """
-        Initialize palm detector.
-        
-        Args:
-            model_path: Path to TFLite model file
-            max_num_hands: Maximum number of hands to detect
-            detection_confidence: MediaPipe detection confidence threshold
-            tracking_confidence: MediaPipe tracking confidence threshold
-            palm_threshold: TFLite palm classification threshold
-            smoothing_window: Number of frames for confidence smoothing
-        """
-        self.model_path = model_path  # kept for compatibility (unused here)
-        self.palm_threshold = palm_threshold
-        self.smoothing_window = smoothing_window
-        
-        # Initialize MediaPipe
-        self._init_mediapipe(max_num_hands, detection_confidence, tracking_confidence)
-        
-        logger.info("PalmDetector initialized (MediaPipe only; downstream model handled elsewhere)")
-
-    
-    def _init_mediapipe(self, max_num_hands: int, detection_confidence: float, tracking_confidence: float):
-        """Initialize MediaPipe hands detection."""
+    def __init__(self, max_num_hands: int = 2, detection_confidence: float = 0.7, tracking_confidence: float = 0.6):
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         
@@ -67,173 +41,78 @@ class PalmDetector:
             min_detection_confidence=detection_confidence,
             min_tracking_confidence=tracking_confidence
         )
-        
-        logger.info("MediaPipe hands initialized")
-    
-    def _compute_palm_bbox(self, hand_landmarks, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
-        """Compute a palm-only bounding box that includes full palm area while excluding fingers.
+        logger.info("PalmDetector initialized")
 
-        Strategy:
-        1. Use wrist (0) and palm base landmarks (1, 2, 5, 9, 13, 17) for palm outline
-        2. Add extra padding to ensure full palm coverage
-        3. Use palm center to determine if we need asymmetric padding
-        """
+    def _compute_palm_bbox(self, hand_landmarks, frame_shape: Tuple[int, int, int]) -> Tuple[int,int,int,int]:
         h, w, _ = frame_shape
-        
-        # Palm landmarks: wrist + palm base + MCP joints (excluding finger tips)
-        palm_landmarks = [0, 1, 2, 5, 9, 13, 17]  # wrist, palm base, MCPs
-        
-        # Get coordinates of palm landmarks
+        palm_landmarks = [0, 1, 2, 5, 9, 13, 17]
         xs = [hand_landmarks.landmark[i].x * w for i in palm_landmarks]
         ys = [hand_landmarks.landmark[i].y * h for i in palm_landmarks]
-        
-        # Calculate palm center for asymmetric padding
-        palm_center_x = np.mean(xs)
-        palm_center_y = np.mean(ys)
-        
-        # Initial bounding box from palm landmarks
-        x_min, x_max = int(max(0, min(xs))), int(min(w, max(xs)))
-        y_min, y_max = int(max(0, min(ys))), int(min(h, max(ys)))
-        
-        # Calculate palm dimensions for proportional padding
-        palm_width = x_max - x_min
-        palm_height = y_max - y_min
-        
-        # Add generous padding to ensure full palm coverage
-        # Use 20-25% of palm size as padding, with minimum of 15px
-        pad_x = max(15, int(palm_width * 0.25))
-        pad_y = max(15, int(palm_height * 0.25))
-        
-        # Apply padding
-        x_min = max(0, x_min - pad_x)
-        y_min = max(0, y_min - pad_y)
-        x_max = min(w, x_max + pad_x)
-        y_max = min(h, y_max + pad_y)
-        
-        # Ensure minimum size for palm detection
+        x_min, x_max = int(max(0,min(xs))), int(min(w,max(xs)))
+        y_min, y_max = int(max(0,min(ys))), int(min(h,max(ys)))
+        palm_width, palm_height = x_max-x_min, y_max-y_min
+        pad_x, pad_y = max(15,int(palm_width*0.25)), max(15,int(palm_height*0.25))
+        x_min, y_min = max(0,x_min-pad_x), max(0,y_min-pad_y)
+        x_max, y_max = min(w,x_max+pad_x), min(h,y_max+pad_y)
         min_size = 40
-        if (x_max - x_min) < min_size:
-            center_x = (x_min + x_max) // 2
-            x_min = max(0, center_x - min_size // 2)
-            x_max = min(w, center_x + min_size // 2)
-        
-        if (y_max - y_min) < min_size:
-            center_y = (y_min + y_max) // 2
-            y_min = max(0, center_y - min_size // 2)
-            y_max = min(h, center_y + min_size // 2)
+        if (x_max-x_min)<min_size: x_min,x_max = max(0,(x_min+x_max)//2 - min_size//2), min(w,(x_min+x_max)//2 + min_size//2)
+        if (y_max-y_min)<min_size: y_min,y_max = max(0,(y_min+y_max)//2 - min_size//2), min(h,(y_min+y_max)//2 + min_size//2)
+        return x_min, y_min, x_max-x_min, y_max-y_min
 
-        return x_min, y_min, x_max - x_min, y_max - y_min
-    
-    # TFLite inference removed from detector; handled in verification module
-    
+    def _resize_with_padding(self, img, size=(96,96)):
+        h, w = img.shape[:2]
+        scale = min(size[0]/h, size[1]/w)
+        new_w, new_h = int(w*scale), int(h*scale)
+        resized = cv2.resize(img, (new_w,new_h))
+        padded = np.zeros(size, dtype=resized.dtype)
+        padded[:new_h,:new_w] = resized
+        return padded
+
+    def _preprocess_palm_roi(self, roi: np.ndarray, landmarks=None) -> np.ndarray:
+        if roi is None or roi.size==0:
+            raise ValueError("Empty ROI")
+        if len(roi.shape)==3: gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        else: gray = roi.copy()
+        resized = self._resize_with_padding(gray)
+        equalized = cv2.equalizeHist(resized)
+        return equalized.astype(np.uint8)
+
+    def _is_palm_facing_camera(self, landmarks) -> bool:
+        fingertip_indices = [4,8,12,16,20]
+        visible = sum(1 for idx in fingertip_indices if landmarks.landmark[idx].z < landmarks.landmark[idx-1].z)
+        return visible>=4
+
     def _get_handedness(self, hand_landmarks) -> str:
-        """
-        Determine handedness from MediaPipe landmarks.
-        
-        Args:
-            hand_landmarks: MediaPipe hand landmarks
-            
-        Returns:
-            "Left" or "Right"
-        """
-        # Use wrist (landmark 0) and middle finger MCP (landmark 9) to determine handedness
-        wrist = hand_landmarks.landmark[0]
-        middle_mcp = hand_landmarks.landmark[9]
-        
-        # If middle finger MCP is to the right of wrist, it's a right hand
-        if middle_mcp.x > wrist.x:
-            return "Right"
-        else:
-            return "Left"
-    
+        return "Right" if hand_landmarks.landmark[9].x > hand_landmarks.landmark[0].x else "Left"
+
     def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, List[PalmDetection]]:
-        """
-        Detect palms in frame using MediaPipe + TFLite.
-        
-        Args:
-            frame: BGR input frame
-            
-        Returns:
-            Tuple of (annotated_frame, list_of_palm_detections)
-        """
-        annotated_frame = frame.copy()
+        annotated = frame.copy()
         detections = []
-        
-        # Convert to RGB for MediaPipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb)
-        
         if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Compute palm-only bounding box (exclude fingers)
-                x_min, y_min, w_box, h_box = self._compute_palm_bbox(hand_landmarks, frame.shape)
-                x_max, y_max = x_min + w_box, y_min + h_box
-
-                # Crop ROI
-                roi = frame[y_min:y_max, x_min:x_max]
-                if roi.size == 0:
+            for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                if not self._is_palm_facing_camera(hand_landmarks):
+                    logger.debug("Palm not facing camera")
                     continue
-                
-                # Preprocess to 96x96 grayscale (no model gating here)
-                roi_96 = preprocess_roi_96(roi)
-
-                # Get handedness
+                x_min,y_min,w_box,h_box = self._compute_palm_bbox(hand_landmarks, frame.shape)
+                roi = frame[y_min:y_min+h_box, x_min:x_min+w_box]
+                if roi.size==0: continue
+                palm_roi = self._preprocess_palm_roi(roi, hand_landmarks)
                 handedness = self._get_handedness(hand_landmarks)
-                
-                palm_roi = roi_96
-                
-                # Create detection object
-                detection = PalmDetection(
-                    bbox=(x_min, y_min, w_box, h_box),
-                    palm_roi=palm_roi,
-                    is_valid_palm=True,  # gating deferred; mark as candidate
-                    tflite_score=0.0,
-                    handedness=handedness
-                )
-                detections.append(detection)
-                
-                # Draw annotations
-                color = (0, 255, 0)
-                label_text = "Palm candidate"
-                
-                cv2.rectangle(annotated_frame, (x_min, y_min), (x_max, y_max), color, 2)
-                cv2.putText(annotated_frame, label_text, (x_min, y_min - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                cv2.putText(annotated_frame, f"Hand: {handedness}", (x_min, y_max + 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-                
-                # Draw hand landmarks
-                self.mp_drawing.draw_landmarks(annotated_frame, hand_landmarks, 
-                                             self.mp_hands.HAND_CONNECTIONS)
-        
-        return annotated_frame, detections
-    
+                confidence = 1.0
+                if results.multi_handedness:
+                    confidence = results.multi_handedness[idx].classification[0].score
+                det = PalmDetection(bbox=(x_min,y_min,w_box,h_box), palm_roi=palm_roi,
+                                    landmarks=hand_landmarks, handedness=handedness, confidence=confidence)
+                detections.append(det)
+                color=(0,255,0)
+                cv2.rectangle(annotated,(x_min,y_min),(x_min+w_box,y_min+h_box),color,2)
+                cv2.putText(annotated,f"Palm({handedness})",(x_min,y_min-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+                cv2.putText(annotated,f"Conf:{confidence:.2f}",(x_min,y_min+h_box+20),cv2.FONT_HERSHEY_SIMPLEX,0.5,color,1)
+                self.mp_drawing.draw_landmarks(annotated, hand_landmarks,self.mp_hands.HAND_CONNECTIONS)
+        return annotated, detections
+
     def close(self):
-        """Clean up resources."""
-        try:
-            if hasattr(self, 'hands'):
-                self.hands.close()
-            logger.info("PalmDetector closed")
-        except Exception as e:
-            logger.error("Error closing PalmDetector: %s", e)
-
-
-def detect_palms(frame: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """
-    Legacy function for backward compatibility.
-    
-    Args:
-        frame: BGR input frame
-        
-    Returns:
-        Tuple of (annotated_frame, list_of_palm_crops)
-    """
-    # Create detector instance (this should be done once and reused)
-    detector = PalmDetector("model/tflite-model/tflite_learn_781277_3.tflite")
-    
-    try:
-        annotated_frame, detections = detector.detect(frame)
-        palm_crops = [det.palm_roi for det in detections if det.is_valid_palm]
-        return annotated_frame, palm_crops
-    finally:
-        detector.close()
+        if hasattr(self,'hands'): self.hands.close()
+        logger.info("PalmDetector closed")

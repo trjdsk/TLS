@@ -1,7 +1,7 @@
 """Database management module for palm verification system.
 
-Manages SQLite database with users and palm feature descriptors.
-Stores hand-crafted features (ORB/SIFT/SURF) instead of embeddings.
+Manages SQLite database with users and palm feature vectors.
+Stores LBP features and optional hand geometry features for biometric verification.
 """
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ def ensure_db(db_path: str = DB_PATH) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 handedness TEXT NOT NULL,
-                descriptors BLOB NOT NULL,
+                feature_vector BLOB NOT NULL,
+                feature_type TEXT NOT NULL DEFAULT 'LBP',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )
@@ -57,22 +58,22 @@ def ensure_db(db_path: str = DB_PATH) -> None:
         conn.close()
 
 
-def serialize_descriptors(descriptors: np.ndarray) -> bytes:
-    """Serialize feature descriptors to bytes for database storage."""
+def serialize_feature_vector(feature_vector: np.ndarray) -> bytes:
+    """Serialize feature vector to bytes for database storage."""
     try:
         # Use pickle for serialization (handles numpy arrays well)
-        return pickle.dumps(descriptors)
+        return pickle.dumps(feature_vector)
     except Exception as e:
-        logger.error("Failed to serialize descriptors: %s", e)
+        logger.error("Failed to serialize feature vector: %s", e)
         raise
 
 
-def deserialize_descriptors(blob: bytes) -> np.ndarray:
-    """Deserialize feature descriptors from database blob."""
+def deserialize_feature_vector(blob: bytes) -> np.ndarray:
+    """Deserialize feature vector from database blob."""
     try:
         return pickle.loads(blob)
     except Exception as e:
-        logger.error("Failed to deserialize descriptors: %s", e)
+        logger.error("Failed to deserialize feature vector: %s", e)
         raise
 
 
@@ -102,15 +103,16 @@ def create_user(name: str, db_path: str = DB_PATH) -> int:
         conn.close()
 
 
-def save_palm_template(user_id: int, handedness: str, descriptors: np.ndarray, 
-                      db_path: str = DB_PATH) -> int:
+def save_palm_template(user_id: int, handedness: str, feature_vector: np.ndarray, 
+                      feature_type: str = "LBP", db_path: str = DB_PATH) -> int:
     """
-    Save palm feature descriptors for a user.
+    Save palm feature vector for a user.
     
     Args:
         user_id: User ID
         handedness: "Left" or "Right"
-        descriptors: Feature descriptors (ORB/SIFT/SURF)
+        feature_vector: Feature vector (LBP + optional geometry)
+        feature_type: Type of features ("LBP", "LBP+Geometry")
         db_path: Path to database file
         
     Returns:
@@ -120,18 +122,18 @@ def save_palm_template(user_id: int, handedness: str, descriptors: np.ndarray,
     conn = sqlite3.connect(db_path)
     try:
         with conn:
-            # Serialize descriptors
-            descriptors_blob = serialize_descriptors(descriptors)
+            # Serialize feature vector
+            feature_blob = serialize_feature_vector(feature_vector)
             
             # Insert template
             cursor = conn.execute("""
-                INSERT INTO palm_templates (user_id, handedness, descriptors) 
-                VALUES (?, ?, ?)
-            """, (user_id, handedness, descriptors_blob))
+                INSERT INTO palm_templates (user_id, handedness, feature_vector, feature_type) 
+                VALUES (?, ?, ?, ?)
+            """, (user_id, handedness, feature_blob, feature_type))
             
             template_id = cursor.lastrowid
-            logger.info("Saved palm template for user %d (%s hand), template ID: %d", 
-                       user_id, handedness, template_id)
+            logger.info("Saved palm template for user %d (%s hand), template ID: %d, type: %s", 
+                       user_id, handedness, template_id, feature_type)
             return template_id
             
     except sqlite3.DatabaseError as e:
@@ -142,7 +144,7 @@ def save_palm_template(user_id: int, handedness: str, descriptors: np.ndarray,
 
 
 def get_user_templates(user_id: int, handedness: Optional[str] = None, 
-                      db_path: str = DB_PATH) -> List[Tuple[int, np.ndarray]]:
+                      db_path: str = DB_PATH) -> List[Tuple[int, np.ndarray, str]]:
     """
     Get palm templates for a user.
     
@@ -152,26 +154,26 @@ def get_user_templates(user_id: int, handedness: Optional[str] = None,
         db_path: Path to database file
         
     Returns:
-        List of (template_id, descriptors) tuples
+        List of (template_id, feature_vector, feature_type) tuples
     """
     ensure_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
         if handedness is not None:
             cursor = conn.execute("""
-                SELECT id, descriptors FROM palm_templates 
+                SELECT id, feature_vector, feature_type FROM palm_templates 
                 WHERE user_id = ? AND handedness = ?
             """, (user_id, handedness))
         else:
             cursor = conn.execute("""
-                SELECT id, descriptors FROM palm_templates 
+                SELECT id, feature_vector, feature_type FROM palm_templates 
                 WHERE user_id = ?
             """, (user_id,))
         
         templates = []
-        for template_id, descriptors_blob in cursor.fetchall():
-            descriptors = deserialize_descriptors(descriptors_blob)
-            templates.append((template_id, descriptors))
+        for template_id, feature_blob, feature_type in cursor.fetchall():
+            feature_vector = deserialize_feature_vector(feature_blob)
+            templates.append((template_id, feature_vector, feature_type))
         
         logger.info("Retrieved %d templates for user %d", len(templates), user_id)
         return templates
@@ -184,7 +186,7 @@ def get_user_templates(user_id: int, handedness: Optional[str] = None,
 
 
 def get_all_templates(handedness: Optional[str] = None, 
-                     db_path: str = DB_PATH) -> List[Tuple[int, int, str, np.ndarray]]:
+                     db_path: str = DB_PATH) -> List[Tuple[int, int, str, np.ndarray, str]]:
     """
     Get all palm templates from database.
     
@@ -193,27 +195,27 @@ def get_all_templates(handedness: Optional[str] = None,
         db_path: Path to database file
         
     Returns:
-        List of (template_id, user_id, handedness, descriptors) tuples
+        List of (template_id, user_id, handedness, feature_vector, feature_type) tuples
     """
     ensure_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
         if handedness is not None:
             cursor = conn.execute("""
-                SELECT pt.id, pt.user_id, pt.handedness, pt.descriptors 
+                SELECT pt.id, pt.user_id, pt.handedness, pt.feature_vector, pt.feature_type 
                 FROM palm_templates pt
                 WHERE pt.handedness = ?
             """, (handedness,))
         else:
             cursor = conn.execute("""
-                SELECT pt.id, pt.user_id, pt.handedness, pt.descriptors 
+                SELECT pt.id, pt.user_id, pt.handedness, pt.feature_vector, pt.feature_type 
                 FROM palm_templates pt
             """)
         
         templates = []
-        for template_id, user_id, hand, descriptors_blob in cursor.fetchall():
-            descriptors = deserialize_descriptors(descriptors_blob)
-            templates.append((template_id, user_id, hand, descriptors))
+        for template_id, user_id, hand, feature_blob, feature_type in cursor.fetchall():
+            feature_vector = deserialize_feature_vector(feature_blob)
+            templates.append((template_id, user_id, hand, feature_vector, feature_type))
         
         logger.info("Retrieved %d templates from database", len(templates))
         return templates

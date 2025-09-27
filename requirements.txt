@@ -2,9 +2,5 @@ numpy>=1.26,<2.0
 opencv-python>=4.7
 mediapipe==0.10.14
 scikit-image>=0.19.0
-edgeimpulse
-tensorflow==2.17.1
-protobuf==4.25.3
-# Hybrid detection pipeline
-# Note: Edge Impulse C++ library must be built separately using model/build.sh or model/build.bat
-# Uses MediaPipe Hands for ROI detection and TFLite for palm verification
+# MediaPipe-only detection pipeline
+# Uses MediaPipe Hands for palm detection and LBP features for biometric verification

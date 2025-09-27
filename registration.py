@@ -1,248 +1,133 @@
-"""Palm registration module using hand-crafted features.
+"""Palm registration module using LBP and hand geometry features.
 
-Extracts ORB/SIFT/SURF features from palm crops and stores them in database.
-Provides palm crease enhancement and feature extraction for registration.
+Extracts Local Binary Pattern (LBP) features and optional hand geometry features
+from palm crops and stores them in database for biometric verification.
 """
 from __future__ import annotations
 
 import logging
 from typing import List, Optional, Sequence, Tuple
-import secrets
 
-import cv2
 import numpy as np
 
-from db import create_user, save_palm_template, get_user_templates, get_user_name
-from preprocessing import preprocess_palm
+from db import create_user, save_palm_template
+from feature_extraction import PalmFeatureExtractor
+from detector import PalmDetection
 
 logger = logging.getLogger(__name__)
 
 
-class PalmFeatureExtractor:
-    """Extracts hand-crafted features from palm images."""
-    
-    def __init__(self, feature_type: str = "ORB", max_features: int = 1000):
+class PalmRegistrar:
+    """Handles palm registration with feature extraction and validation."""
+
+    def __init__(self, use_geometry: bool = True, min_confidence: float = 0.7,
+                 min_lbp_variance: float = 0.005):
         """
-        Initialize feature extractor.
-        
+        Initialize registrar.
+
         Args:
-            feature_type: "ORB", "SIFT", or "SURF"
-            max_features: Maximum number of features to extract
+            use_geometry: Whether to include hand geometry features
+            min_confidence: Minimum MediaPipe confidence to accept a palm
+            min_lbp_variance: Minimum variance of LBP histogram to accept a palm
         """
-        self.feature_type = feature_type.upper()
-        self.max_features = max_features
-        self._init_detector()
-        
-        logger.info("PalmFeatureExtractor initialized with %s (max_features=%d)", 
-                   feature_type, max_features)
-    
-    def _init_detector(self):
-        """Initialize the feature detector."""
-        if self.feature_type == "ORB":
-            self.detector = cv2.ORB_create(nfeatures=self.max_features)
-        elif self.feature_type == "SIFT":
-            try:
-                self.detector = cv2.SIFT_create(nfeatures=self.max_features)
-            except AttributeError:
-                logger.warning("SIFT not available, falling back to ORB")
-                self.detector = cv2.ORB_create(nfeatures=self.max_features)
-                self.feature_type = "ORB"
-        elif self.feature_type == "SURF":
-            try:
-                # SURF requires non-free OpenCV
-                self.detector = cv2.xfeatures2d.SURF_create(hessianThreshold=400)
-            except AttributeError:
-                logger.warning("SURF not available, falling back to ORB")
-                self.detector = cv2.ORB_create(nfeatures=self.max_features)
-                self.feature_type = "ORB"
-        else:
-            logger.warning("Unknown feature type %s, using ORB", self.feature_type)
-            self.detector = cv2.ORB_create(nfeatures=self.max_features)
-            self.feature_type = "ORB"
-    
-    def enhance_palm_creases(self, palm_roi: np.ndarray) -> np.ndarray:
+        self.use_geometry = use_geometry
+        self.min_confidence = min_confidence
+        self.min_lbp_variance = min_lbp_variance
+        self.extractor = PalmFeatureExtractor(use_geometry=use_geometry)
+
+    def _is_palm_facing_camera(self, landmarks) -> bool:
         """
-        Enhance palm creases using preprocessing techniques.
-        
+        Estimate if the palm is facing the camera using landmarks.
+        """
+        import numpy as np
+        p0 = np.array([landmarks.landmark[0].x, landmarks.landmark[0].y, landmarks.landmark[0].z])
+        p5 = np.array([landmarks.landmark[5].x, landmarks.landmark[5].y, landmarks.landmark[5].z])
+        p17 = np.array([landmarks.landmark[17].x, landmarks.landmark[17].y, landmarks.landmark[17].z])
+
+        v1 = p5 - p0
+        v2 = p17 - p0
+        normal = np.cross(v1, v2)
+
+        # Negative z toward camera
+        return normal[2] < 0
+
+    def _validate_detection(self, detection: PalmDetection) -> bool:
+        """Validate a palm detection for registration."""
+        if detection.confidence < self.min_confidence:
+            logger.debug("Palm detection confidence too low: %.2f < %.2f",
+                         detection.confidence, self.min_confidence)
+            return False
+
+        if detection.palm_roi is None or detection.palm_roi.size == 0:
+            logger.debug("Empty palm ROI")
+            return False
+
+        if detection.palm_roi.shape != (96, 96):
+            logger.debug("Invalid palm ROI shape: %s", detection.palm_roi.shape)
+            return False
+
+        if detection.landmarks is None:
+            logger.debug("No landmarks available for geometry features")
+            return False
+
+        if not self._is_palm_facing_camera(detection.landmarks):
+            logger.debug("Palm not facing camera, rejecting detection")
+            return False
+
+        # Check LBP variance
+        lbp_features = self.extractor.lbp_extractor.extract_lbp_features(detection.palm_roi)
+        if np.var(lbp_features) < self.min_lbp_variance:
+            logger.debug("LBP variance too low: %.5f < %.5f, rejecting detection",
+                         np.var(lbp_features), self.min_lbp_variance)
+            return False
+
+        return True
+
+    def register_user_with_features(self, palm_detections: Sequence[PalmDetection],
+                                    name: str = "Unknown", handedness: str = "Right") -> Tuple[bool, Optional[int]]:
+        """
+        Register a new user with validated palm feature vectors.
+
         Args:
-            palm_roi: 96x96 grayscale palm image
-            
+            palm_detections: List of PalmDetection objects
+            name: User name
+            handedness: "Left" or "Right"
+
         Returns:
-            Enhanced palm image with highlighted creases
+            Tuple of (success, user_id)
         """
-        # Convert to grayscale if needed
-        if len(palm_roi.shape) == 3:
-            gray = cv2.cvtColor(palm_roi, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = palm_roi.copy()
-        
-        # Histogram equalization for lighting normalization
-        equalized = cv2.equalizeHist(gray)
-        
-        # Edge enhancement using Laplacian
-        laplacian = cv2.Laplacian(equalized, cv2.CV_64F)
-        laplacian = np.uint8(np.absolute(laplacian))
-        
-        # Combine original with enhanced edges
-        enhanced = cv2.addWeighted(equalized, 0.7, laplacian, 0.3, 0)
-        
-        # Optional: Sobel edge detection for additional crease highlighting
-        sobel_x = cv2.Sobel(enhanced, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
-        sobel_magnitude = np.uint8(sobel_magnitude / sobel_magnitude.max() * 255)
-        
-        # Final combination
-        final = cv2.addWeighted(enhanced, 0.8, sobel_magnitude, 0.2, 0)
-        
-        return final
-    
-    def extract_features(self, palm_roi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract features from palm ROI.
-        
-        Args:
-            palm_roi: 96x96 grayscale palm image
-            
-        Returns:
-            Tuple of (keypoints, descriptors)
-        """
-        # Use shared biometric preprocessing for reproducibility
-        enhanced = preprocess_palm(palm_roi)
-        
-        # Extract features
-        keypoints, descriptors = self.detector.detectAndCompute(enhanced, None)
-        
-        if descriptors is None:
-            logger.warning("No features detected in palm ROI")
-            return np.array([]), np.array([])
-        
-        logger.debug("Extracted %d %s features", len(keypoints), self.feature_type)
-        return keypoints, descriptors
-
-
-def verify_palm_for_registration(palm_roi: np.ndarray, threshold: float = 0.5) -> bool:
-    """Verify that the ROI contains a palm using Edge Impulse model during registration.
-    
-    Args:
-        palm_roi: Preprocessed palm ROI (96x96 grayscale)
-        threshold: Confidence threshold for palm detection
-        
-    Returns:
-        True if palm is detected, False otherwise
-    """
-    try:
-        from model_wrapper import get_model
-        
-        model = get_model()
-        if model.is_initialized:
-            # ROI should already be preprocessed by detector
-            return model.is_palm(palm_roi, threshold)
-        else:
-            logger.warning("Edge Impulse model not initialized, cannot verify palm during registration")
-            return True  # Allow registration to proceed if model not available
-    except Exception as exc:
-        logger.warning("Edge Impulse model not available for registration verification: %s", exc)
-        return True  # Allow registration to proceed if model not available
-
-
-def register_user_with_features(palm_crops: Sequence[np.ndarray], handedness: str = "Right", 
-                               name: str = "Unknown", feature_type: str = "ORB") -> Tuple[bool, Optional[int]]:
-    """
-    Register a new user with palm feature descriptors.
-    
-    Args:
-        palm_crops: List of 96x96 grayscale palm crops
-        handedness: "Left" or "Right"
-        name: User's name
-        feature_type: "ORB", "SIFT", or "SURF"
-        
-    Returns:
-        Tuple of (success, user_id)
-    """
-    if not palm_crops:
-        logger.error("No palm crops provided for registration")
-        return False, None
-    
-    try:
-        # Create feature extractor
-        extractor = PalmFeatureExtractor(feature_type=feature_type)
-        
-        # Verify all palm crops are valid
-        valid_crops = []
-        for crop in palm_crops:
-            if verify_palm_for_registration(crop):
-                valid_crops.append(crop)
-            else:
-                logger.warning("Invalid palm detected in registration crop")
-        
-        if not valid_crops:
-            logger.error("No valid palm crops found for registration")
+        if not palm_detections:
+            logger.error("No palm detections provided for registration")
             return False, None
-        
-        # Extract features from all valid crops
-        all_descriptors = []
-        for crop in valid_crops:
-            # Ensure reproducible preprocessing before feature extraction
-            crease = preprocess_palm(crop)
-            keypoints, descriptors = extractor.extract_features(crease)
-            if descriptors is not None and len(descriptors) > 0:
-                all_descriptors.append(descriptors)
-        
-        if not all_descriptors:
-            logger.error("No features extracted from palm crops")
+
+        # Validate detections
+        valid_detections = [d for d in palm_detections if self._validate_detection(d)]
+        if not valid_detections:
+            logger.error("No valid palm detections found for registration")
             return False, None
-        
-        # Combine descriptors from all crops
-        combined_descriptors = np.vstack(all_descriptors)
-        
+
+        # Extract features from valid detections
+        all_features = []
+        for detection in valid_detections:
+            features = self.extractor.extract_features(detection.palm_roi, detection.landmarks)
+            if features is not None and len(features) > 0:
+                all_features.append(features)
+
+        if not all_features:
+            logger.error("No features extracted from valid palm detections")
+            return False, None
+
+        # Average features for robust template
+        combined_features = np.mean(all_features, axis=0)
+
         # Create user in database
         user_id = create_user(name)
-        
+        feature_type = "LBP+Geometry" if self.use_geometry else "LBP"
+
         # Save palm template
-        template_id = save_palm_template(user_id, handedness, combined_descriptors)
-        
-        logger.info("Successfully registered user %s (ID: %d) with %d features from %d crops", 
-                   name, user_id, len(combined_descriptors), len(valid_crops))
-        
+        save_palm_template(user_id, handedness, combined_features, feature_type)
+
+        logger.info("Successfully registered user %s (ID: %d) with %d features from %d detections",
+                    name, user_id, len(combined_features), len(valid_detections))
+
         return True, user_id
-        
-    except Exception as e:
-        logger.error("Registration failed: %s", e)
-        return False, None
-
-
-def register_user(user_id: str, embeddings_list: Sequence[np.ndarray], handedness: str = "Right", name: str = "Unknown", db_path: str = "palms.db") -> bool:
-    """
-    Legacy function for backward compatibility.
-    Converts embeddings to features and registers user.
-    """
-    logger.warning("Using legacy register_user function - consider using register_user_with_features")
-    
-    # Convert embeddings to dummy features for compatibility
-    # This is a temporary solution - should be replaced with proper feature extraction
-    try:
-        # Create dummy descriptors from embeddings
-        dummy_descriptors = np.random.rand(100, 32).astype(np.uint8)  # ORB-like descriptors
-        
-        # Create user in database
-        user_id_int = create_user(name)
-        
-        # Save palm template
-        save_palm_template(user_id_int, handedness, dummy_descriptors)
-        
-        return True
-    except Exception as e:
-        logger.error("Legacy registration failed: %s", e)
-        return False
-
-
-def extract_embedding(roi_bgr: np.ndarray) -> np.ndarray:
-    """
-    Legacy function for backward compatibility.
-    Extracts dummy embedding from palm ROI.
-    """
-    logger.warning("Using legacy extract_embedding function - consider using PalmFeatureExtractor")
-    
-    # Return dummy embedding for compatibility
-    return np.random.rand(128).astype(np.float32)
