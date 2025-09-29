@@ -43,6 +43,10 @@ class VideoCapture:
         self._cap: Optional[cv2.VideoCapture] = None
         self.save_snaps: bool = save_snaps
         self.snaps_dir: str = snaps_dir or "snapshots"
+        # Snapshot delay mechanism
+        self._hand_detected_time: Optional[float] = None
+        self._snapshot_delay: float = 0.5  # 0.5 seconds delay
+        self._snapshot_taken: bool = False
 
     def open(self) -> None:
         """Open the video source and apply optional resolution settings."""
@@ -100,28 +104,44 @@ class VideoCapture:
             annotated_frame, detections = self.detector.detect(frame)
 
             # Optionally save snapshots of each detection (original ROI and 96x96)
+            # with 0.5s delay after hand detection
             if self.save_snaps and detections:
-                try:
-                    os.makedirs(self.snaps_dir, exist_ok=True)
-                    ts_ms = int(time.time() * 1000)
-                    for idx, det in enumerate(detections):
-                        x, y, w, h = det.bbox
-                        x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
-                        orig_roi = frame[y:y2, x:x2]
-                        hand = det.handedness or "Unknown"
-                        base = f"{ts_ms}_{idx}_{hand}"
-                        # Save original ROI (BGR)
-                        try:
-                            cv2.imwrite(os.path.join(self.snaps_dir, f"roi_{base}.png"), orig_roi)
-                        except Exception:
-                            logger.debug("Failed to save original ROI snapshot")
-                        # Save 96x96 grayscale
-                        try:
-                            cv2.imwrite(os.path.join(self.snaps_dir, f"roi96_{base}.png"), det.palm_roi)
-                        except Exception:
-                            logger.debug("Failed to save 96x96 ROI snapshot")
-                except Exception:
-                    logger.debug("Snapshot saving failed")
+                current_time = time.time()
+                
+                # If this is the first detection or enough time has passed since last snapshot
+                if self._hand_detected_time is None:
+                    self._hand_detected_time = current_time
+                    self._snapshot_taken = False
+                    logger.debug("Hand detected, starting 0.5s delay timer")
+                elif not self._snapshot_taken and (current_time - self._hand_detected_time) >= self._snapshot_delay:
+                    # Delay has passed, take snapshot
+                    try:
+                        os.makedirs(self.snaps_dir, exist_ok=True)
+                        ts_ms = int(current_time * 1000)
+                        for idx, det in enumerate(detections):
+                            x, y, w, h = det.bbox
+                            x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+                            orig_roi = frame[y:y2, x:x2]
+                            hand = det.handedness or "Unknown"
+                            base = f"{ts_ms}_{idx}_{hand}"
+                            # Save original ROI (BGR)
+                            try:
+                                cv2.imwrite(os.path.join(self.snaps_dir, f"roi_{base}.png"), orig_roi)
+                            except Exception:
+                                logger.debug("Failed to save original ROI snapshot")
+                            # Save 96x96 grayscale
+                            try:
+                                cv2.imwrite(os.path.join(self.snaps_dir, f"roi96_{base}.png"), det.palm_roi)
+                            except Exception:
+                                logger.debug("Failed to save 96x96 ROI snapshot")
+                        self._snapshot_taken = True
+                        logger.debug("Snapshot taken after 0.5s delay")
+                    except Exception:
+                        logger.debug("Snapshot saving failed")
+            elif not detections and self._hand_detected_time is not None:
+                # No hand detected, reset the timer
+                self._hand_detected_time = None
+                self._snapshot_taken = False
             
             return True, annotated_frame, detections
             

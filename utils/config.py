@@ -24,7 +24,7 @@ DISPLAY_DEFAULT = True         # whether to show frames in window
 # ----------------------
 # MediaPipe / Detector defaults
 # ----------------------
-MAX_NUM_HANDS = 2
+MAX_NUM_HANDS = 1
 DETECTION_CONFIDENCE = 0.7
 TRACKING_CONFIDENCE = 0.6
 

@@ -1,306 +1,184 @@
-# TLS Palm Recognition System
-
-A robust, real-time palm recognition system built with Python, OpenCV, and TensorFlow Lite. This system provides secure palm-based authentication with advanced features including computer vision-based detection, palm orientation normalization, and strict verification protocols.
-
-## 🚀 Features
-
-### Core Capabilities
-- **Real-time Palm Detection**: Uses computer vision techniques for accurate hand region detection
-- **TensorFlow Lite Integration**: Advanced palm verification using trained TFLite models
-- **Universal Palm Recognition**: Works with any hand orientation
-- **Palm Orientation Normalization**: Consistent palm orientation for improved recognition accuracy
-- **Strict Verification Protocols**: High-precision matching with variance checking
-- **Robust Registration Process**: 15-snapshot registration with hand side selection and name collection
-- **SQLite Database**: Persistent storage with automatic schema migration
-
-### Advanced Features
-- **Computer Vision Pipeline**: Thresholding and contour detection + TFLite for palm verification
-- **Configurable Thresholds**: Adjustable similarity and variance parameters
-- **Palm-Only Mode**: Filters to open palm detections only (default)
-- **Palm Region Focus**: Extracts palm-only regions excluding fingers (default)
-- **ESP32 Ready**: Communication framework for hardware deployment
-
-## 📋 Requirements
-
-- Python 3.8+
-- OpenCV 4.7+
-- TensorFlow 2.17.1
-- NumPy 1.26+
-- scikit-image 0.19.0+
-
-## 🛠️ Installation
-
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd TLS
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Run the system**:
-   ```bash
-   python main.py
-   ```
-
-## 🎮 Usage
-
-### Basic Operation
-
-**Start the system**:
-```bash
-python main.py
-```
-
-**Controls**:
-- `r` - Start palm registration
-- `c` - Cancel current registration
-- `q` - Quit the application
-
-### Registration Process
-
-1. Press `r` to start registration
-2. **Select hand side**: Choose between Left or Right hand
-3. The system will capture 15 snapshots with movement guidance
-4. Follow the on-screen instructions for varied hand positions
-5. **Enter your name**: After successful capture, enter your name in the terminal
-6. Registration completes automatically when 15 valid snapshots are captured
-
-### Verification Process
-
-- **Automatic**: The system continuously verifies palms in real-time
-- **5 Snapshot Requirement**: Captures 5 snapshots for verification
-- **Strict Matching**: All snapshots must meet similarity thresholds
-- **1-Second Cooldown**: Completely stops detection for 1 second after each verification result
-
-## ⚙️ Configuration
-
-### Command Line Options
-
-#### Detection Settings
-```bash
---palm-threshold THRESHOLD        # TFLite palm validation threshold (default: 0.1)
---source SOURCE                    # Camera index or stream URL (default: 0)
---width WIDTH                      # Desired frame width
---height HEIGHT                    # Desired frame height
-```
-
-#### Palm Detection Modes
-```bash
---no-palm-only                    # Disable palm-only filtering (allow all hand poses)
---no-palm-region-only             # Show full hand landmarks instead of palm region only
-```
-
-#### Performance Tuning
-```bash
---max-fps FPS                     # Limit processing FPS (default: 30.0)
---process-every N                 # Process every Nth frame when not registering (default: 1)
---cv2-threads N                   # Set OpenCV thread count
-```
-
-#### Computer Vision Settings
-```bash
---palm-threshold FLOAT            # Palm validation threshold (default: 0.1)
-```
-
-
-#### System Settings
-```bash
---log-level LEVEL                 # Logging level (default: INFO)
---display                         # Show window and accept hotkeys (default: enabled)
---no-display                      # Run headless mode
-```
-
-### Example Commands
-
-**Basic usage with default settings**:
-```bash
-python main.py
-```
-
-**High-performance mode**:
-```bash
-python main.py --max-fps 60 --cv2-threads 4 --process-every 2
-```
-
-**Debug mode with verbose logging**:
-```bash
-python main.py --log-level DEBUG --no-display
-```
-
-**Allow all hand poses**:
-```bash
-python main.py --no-palm-only --no-palm-region-only
-```
-
-## 🏗️ Architecture
-
-### System Components
-
-```
-main.py              # Main application entry point
-├── camera.py        # Video capture abstraction
-├── detector.py      # Palm detection using computer vision + TFLite
-├── registration.py  # Palm registration and embedding extraction
-├── verification.py  # Palm verification and matching
-├── model_wrapper.py # Edge Impulse model interface
-├── model/           # Edge Impulse model and SDK
-│   ├── edge-impulse-sdk/      # Edge Impulse SDK
-│   ├── tflite-model/          # TensorFlow Lite model
-│   ├── model-parameters/      # Model metadata
-│   └── libedge_impulse_model.so  # Compiled model library
-└── schema.sql       # Database schema definition
-```
-
-### Edge Impulse Integration
-
-The system uses a **computer vision approach** combining:
-- **OpenCV thresholding and contour detection** for fast hand region detection
-- **TensorFlow Lite model** for palm verification and recognition
-
-#### Model Specifications
-- **Input**: 96x96 grayscale images
-- **Output**: 2 classes ("not_palm", "palm")  
-- **Framework**: TensorFlow Lite with INT8 quantization
-- **Memory**: ~361KB model size
-- **Inference Speed**: ~5-10ms per frame
-
-### Database Schema
-
-```sql
-CREATE TABLE registered_palms (
-    user_id TEXT PRIMARY KEY,
-    name TEXT,
-    embeddings BLOB NOT NULL
-);
-```
-
-### Key Features Explained
-
-#### Palm-Only Mode (Default)
-- **`--palm-only`**: Filters detections to open palms only using finger extension heuristics
-- **`--palm-region-only`**: Extracts palm-only bounding boxes excluding fingers
-- **Impact**: Improves recognition accuracy by focusing on palm features rather than finger positions
-
-
-#### Palm Normalization
-- **Orientation Correction**: Uses wrist-to-middle-finger-MCP vector for consistent orientation
-- **Rotation**: Automatically rotates palm to upward orientation
-- **Consistency**: Reduces left/right hand confusion
-
-#### Verification Thresholds
-- **Similarity Threshold**: 0.92 (individual snapshot matching)
-- **Average Similarity**: 0.90 (overall match quality)
-- **Peak Similarity**: 0.95 (best single match)
-- **Variance Limit**: 0.05 (consistency requirement)
-
-## 🔧 Development
-
-### Adding New Detection Backends
-
-The system supports pluggable detection backends. To add a new backend:
-
-1. **Implement the backend class** in `detector.py`
-2. **Add backend selection** in `PalmDetector.__init__()`
-3. **Update command line options** in `main.py`
-
-### Customizing Embedding Extraction
-
-The `extract_embedding()` function in `registration.py` is designed to be easily replaceable:
-
-```python
-def extract_embedding(roi_bgr: np.ndarray) -> np.ndarray:
-    # Current implementation uses multi-feature approach
-    # Replace with Edge Impulse model or other embedding extractor
-    pass
-```
-
-### Database Migration
-
-The system automatically migrates existing databases to remove handedness:
-
-- **Existing Users**: Keeps first occurrence of each user_id
-- **Schema Updates**: Handled transparently on first run
-- **Backward Compatibility**: Preserves all existing data
-
-## 📊 Performance
-
-### Recommended Settings
-
-**High Accuracy**:
-```bash
-python main.py --mp-det-conf 0.7 --mp-track-conf 0.7
-```
-
-**High Performance**:
-```bash
-python main.py --max-fps 60 --process-every 2 --cv2-threads 4
-```
-
-**Balanced**:
-```bash
-python main.py --max-fps 30 --mp-det-conf 0.5 --mp-track-conf 0.5
-```
-
-### System Requirements
-
-- **CPU**: Multi-core processor recommended
-- **RAM**: 4GB+ recommended
-- **Camera**: USB webcam or built-in camera
-- **OS**: Linux, Windows, macOS
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Camera not detected**:
-```bash
-python main.py --source 1  # Try different camera index
-```
-
-**Low detection accuracy**:
-```bash
-python main.py --mp-det-conf 0.7 --mp-track-conf 0.7
-```
-
-**Performance issues**:
-```bash
-python main.py --max-fps 15 --process-every 3 --cv2-threads 1
-```
-
-**Database errors**:
-- Delete `palms.db` to reset database
-- Check file permissions in project directory
-
-### Debug Mode
-
-Enable verbose logging for troubleshooting:
-```bash
-python main.py --log-level DEBUG
-```
-
-## 📝 License
-
-[Add your license information here]
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 📞 Support
-
-For issues and questions:
-- Create an issue in the repository
-- Check the troubleshooting section
-- Review the debug logs with `--log-level DEBUG`
+## Touchless Lock System (TLS)
+
+Computer‑vision palm verification pipeline for a touchless door lock. Streams video, detects palms with MediaPipe, extracts robust LBP+geometry features, and verifies against registered users. Optional ESP32 signaling can unlock a door on successful verification.
+
+### Highlights
+- Real‑time palm detection with MediaPipe Hands
+- Tiled‑LBP features plus optional palm‑geometry descriptors
+- Registration and verification flows with similarity matching
+- Snapshot saving for ROIs and extracted features when enabled
+- Modular, testable design
 
 ---
 
-**Note**: This system is designed for educational and research purposes. For production use, consider additional security measures and performance optimizations.
+## Quick Start
+
+### Prerequisites
+- Linux recommended
+- Python 3.11 or 3.12 strongly recommended (best wheels support)
+- Webcam supported by OpenCV
+
+If you must use Python 3.13, you may need system build headers and newer wheels.
+
+### Setup
+```bash
+cd TLS
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+### Run
+```bash
+python main.py
+```
+Keys:
+- q: Quit
+- r: Start registration flow
+
+---
+
+## CLI Options
+```bash
+python main.py \
+  --source 0 \
+  --width 640 --height 480 \
+  --max-fps 30 \
+  --detection-confidence 0.7 \
+  --tracking-confidence 0.6 \
+  --use-geometry \
+  --similarity-threshold 0.92 \
+  --camera-buffer-size 3 \
+  --cv2-threads 2 \
+  --display \
+  --esp32-enabled --esp32-port /dev/ttyUSB0 \
+  --save-snaps --snaps-dir snapshots
+```
+Notes:
+- `--use-geometry` toggles geometry features on top of LBP.
+- `--save-snaps` stores palm ROI images and feature files to `--snaps-dir`.
+
+---
+
+## Project Structure
+```
+TLS/
+  main.py                 # App entry; orchestrates camera, detector, flows, UI
+  camera.py               # VideoCapture wrapper integrating detection per frame
+  detector.py             # MediaPipe-based palm detector + ROI builder
+  preprocessing.py        # Optional ROI preprocessing helper (if present)
+  feature_extraction.py   # LBP + optional geometry feature extraction
+  registration.py         # Registration flow; averages features; stores in DB
+  verification.py         # Verification flow; compares features to templates
+  db.py                   # SQLite helpers for users and palm templates
+  schema.sql              # Database schema
+  utils/
+    config.py             # Centralized runtime configuration constants
+    palm.py               # Palm-facing heuristic/utilities
+  requirements.txt
+  README.md
+```
+
+---
+
+## Architecture & Data Flow
+1. Camera capture (`camera.VideoCapture`)
+   - Reads frames from source
+   - Calls `PalmDetector.detect` to annotate frame and return palm detections
+2. Palm detection (`detector.PalmDetector`)
+   - Runs MediaPipe Hands (max hands from `utils/config.py`)
+   - Validates palm orientation via `utils.palm.is_palm_facing_camera`
+   - Builds palm ROI and preprocesses (96×96)
+   - Returns `PalmDetection`: `(bbox, palm_roi, landmarks, handedness, confidence)`
+3. Registration (`registration.PalmRegistrar`)
+   - Validates orientation, handedness consistency, and LBP variance
+   - Extracts features once per detection via `PalmFeatureExtractor`
+   - Averages valid feature vectors to a template and stores in DB
+
+4. Verification (`verification.PalmVerifier` / `verify_palm_with_features`)
+   - Validates and extracts features for current detections
+   - Loads all user templates and computes cosine similarity
+   - Grants access if best score exceeds threshold
+
+---
+
+## Modules
+
+### `main.py`
+- Parses CLI, sets logging, configures OpenCV threading
+- Instantiates `PalmDetector`, `PalmRegistrar`, `VideoCapture`
+- Event loop manages registration and verification flows
+- Optional ESP32 signaling hooks
+
+### `camera.py`
+- Wrapper around OpenCV capture
+- Holds a `PalmDetector` instance
+- `get_palm_frame()` → `(success, annotated_frame, palm_detections)`
+- Handles resize/buffer; saves ROIs if `--save-snaps`
+
+### `detector.py`
+- `DetectorConfig`: ROI size, confidences, padding, drawing, etc.
+- `PalmDetector.detect(frame)`:
+  - MediaPipe Hands inference
+  - Orientation check using `utils.palm`
+  - ROI extraction + preprocessing to 96×96
+  - Optional debug drawing
+
+### `feature_extraction.py`
+- `LBPExtractor`: tiled-LBP histograms; returns `(vector, variance, tile_variances)`
+- `GeometryFeatureExtractor`: landmark statistics (mean/std/max-distance)
+- `PalmFeatureExtractor`: concatenates LBP and optional geometry into single vector
+- `cosine_similarity` helper for verification
+
+### `registration.py`
+- `RegistrarConfig`: thresholds, `use_geometry`, snapshot options
+- `PalmRegistrar.register_user_with_features(...)`:
+  - Validates each detection once
+  - Averages features; writes to DB via `db.save_palm_template`
+
+### `verification.py`
+- `PalmVerifier`: validates/extracts features and compares against templates
+- `verify_palm_with_features(...)`: scans all users and returns first/best match
+
+### `db.py` / `schema.sql`
+- SQLite-based storage for users and templates
+- `create_user`, `save_palm_template`, `load_user_templates`
+
+### `utils/config.py`
+- Central constants: detector thresholds, ROI size, similarity threshold, UI/window
+
+### `utils/palm.py`
+- Shared palm orientation heuristic
+
+---
+
+## Snapshots & Saved Artifacts
+When `--save-snaps` is enabled:
+- ROI images: saved by `camera.VideoCapture` as `roi_*.png` and optionally preprocessed `roi96_*.png`
+
+---
+
+## Tuning
+- `DETECTION_CONFIDENCE`, `TRACKING_CONFIDENCE`: MediaPipe sensitivity
+- `VARIANCE_THRESHOLD`: gate low-contrast LBP ROIs
+- `similarity_threshold`: matching strictness (default ~0.92)
+- Try `--use-geometry` or lower `similarity_threshold` if false negatives occur
+
+---
+
+## Troubleshooting
+- Prefer Python 3.11/3.12 for prebuilt wheels (numpy/mediapipe/opencv)
+- On Python 3.13 you may need `python3.13-devel`, BLAS/LAPACK, etc.
+- If no frames: check `--source`, reduce resolution, verify camera permissions
+- Few detections: improve lighting; ensure palm faces camera
+- Registration issues: maintain consistent handedness and stable pose
+
+---
+
+## Development
+- Clear naming, early returns, minimal inline comments
+- Put new tunables in `utils/config.py`
+- Keep hardware-specific code isolated (e.g., ESP32 signaling)
+
+---
