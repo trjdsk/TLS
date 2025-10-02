@@ -23,6 +23,7 @@ from typing import Optional, Union, Any, Dict, List
 import sys
 import time
 import math
+import threading
 
 import cv2
 import numpy as np
@@ -35,6 +36,7 @@ from registration import PalmRegistrar, RegistrarConfig
 from verification import verify_palm_with_features
 from utils.palm import is_palm_facing_camera
 from utils import config
+from esp32_cam_helper import ESP32CamHelper
 
 # Attempt to import a shared palm utility; if not available, use fallback
 try:
@@ -60,6 +62,13 @@ class AppConfig:
     esp32_port: Optional[str] = config.ESP32_PORT_DEFAULT
     save_snaps: bool = config.SAVE_SNAPS_DEFAULT
     snaps_dir: Optional[str] = str(config.SNAPS_DIR)
+
+
+class CameraMode:
+    """Enum-like class for camera modes."""
+    MAIN_CAMERA = "main_camera"
+    ESP32_CAM = "esp32_cam"
+    SEARCHING = "searching"
 
 
 def setup_logging(level: str = None) -> None:
@@ -241,7 +250,14 @@ def main() -> None:
         except Exception:
             pass
 
-    status_text = "Touchless Lock System Ready. Press 'r' to Register, 'q' to quit."
+    # Camera mode management
+    camera_mode = CameraMode.MAIN_CAMERA
+    esp32_helper = ESP32CamHelper()
+    esp32_connected = False
+    esp32_ip = None
+    esp32_port = 80
+    
+    status_text = "Touchless Lock System Ready. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
 
     registering: bool = False
     registration_detections: List[PalmDetection] = []
@@ -260,10 +276,27 @@ def main() -> None:
             frame_index += 1
 
             now = time.time()
-            # Fetch frame and detections
+            # Fetch frame and detections based on camera mode
             success, annotated, palm_detections = False, None, None
             try:
-                success, annotated, palm_detections = cap.get_palm_frame()
+                if camera_mode == CameraMode.MAIN_CAMERA:
+                    success, annotated, palm_detections = cap.get_palm_frame()
+                elif camera_mode == CameraMode.ESP32_CAM and esp32_connected:
+                    # Get frame from ESP32-CAM
+                    esp32_frame = esp32_helper.get_frame()
+                    if esp32_frame is not None:
+                        # Process ESP32 frame with detector
+                        annotated, palm_detections = detector.detect(esp32_frame)
+                        success = True
+                    else:
+                        success = False
+                elif camera_mode == CameraMode.SEARCHING:
+                    # Show searching status
+                    success = True
+                    annotated = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(annotated, "Searching for ESP32-CAM devices...", (50, 240), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    palm_detections = None
             except Exception as exc:
                 logger.error("Error fetching frame: %s", exc, exc_info=True)
                 break
@@ -356,7 +389,7 @@ def main() -> None:
                             verification_detections.clear()
                             verification_cooldown = now + config.VERIFICATION_COOLDOWN_SECONDS
                     else:
-                        status_text = "No valid palm detected. Press 'r' to Register, 'q' to quit."
+                        status_text = "No valid palm detected. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
 
             # Display
             if app_cfg.display and annotated is not None:
@@ -374,6 +407,53 @@ def main() -> None:
             if key == ord("q"):
                 logger.info("Quit requested by user.")
                 break
+            elif key == ord("1"):  # Switch to main camera
+                if camera_mode != CameraMode.MAIN_CAMERA:
+                    camera_mode = CameraMode.MAIN_CAMERA
+                    if esp32_connected:
+                        esp32_helper.disconnect()
+                        esp32_connected = False
+                    status_text = "Switched to Main Camera. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                    print_status("Switched to Main Camera")
+            elif key == ord("2"):  # Connect to ESP32-CAM
+                if camera_mode != CameraMode.SEARCHING:
+                    camera_mode = CameraMode.SEARCHING
+                    status_text = "Enter ESP32-CAM IP address..."
+                    print_status("Enter ESP32-CAM IP address (e.g., 192.168.1.100): ")
+                    
+                    # Get IP address from user input
+                    try:
+                        user_ip = input("ESP32-CAM IP address: ").strip()
+                        if user_ip:
+                            # Test the IP address
+                            if esp32_helper.test_specific_ip(user_ip):
+                                print_status(f"Testing connection to {user_ip}...")
+                                
+                                # Try to connect
+                                if esp32_helper.connect_to_stream(user_ip, 80, 81):
+                                    esp32_ip = user_ip
+                                    esp32_port = 80
+                                    esp32_connected = True
+                                    camera_mode = CameraMode.ESP32_CAM
+                                    status_text = f"Connected to ESP32-CAM at {user_ip}. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                                    print_status(f"Connected to ESP32-CAM at {user_ip}")
+                                else:
+                                    camera_mode = CameraMode.MAIN_CAMERA
+                                    status_text = f"Failed to connect to ESP32-CAM at {user_ip}. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                                    print_status(f"Failed to connect to ESP32-CAM at {user_ip}")
+                            else:
+                                camera_mode = CameraMode.MAIN_CAMERA
+                                status_text = f"No ESP32-CAM found at {user_ip}. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                                print_status(f"No ESP32-CAM found at {user_ip}")
+                        else:
+                            camera_mode = CameraMode.MAIN_CAMERA
+                            status_text = "No IP address entered. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                            print_status("No IP address entered")
+                    except Exception as exc:
+                        logger.error("ESP32-CAM connection error: %s", exc, exc_info=True)
+                        camera_mode = CameraMode.MAIN_CAMERA
+                        status_text = "ESP32-CAM connection failed. Press '1' for Main Camera, '2' to enter ESP32-CAM IP, 'r' to Register, 'q' to quit."
+                        print_status("ESP32-CAM connection failed")
             elif key == ord("r") and not registering:
                 registering = True
                 registration_detections.clear()
@@ -418,6 +498,12 @@ def main() -> None:
                 cap.release()
         except Exception:
             logger.debug("Error releasing capture", exc_info=True)
+            
+        try:
+            if esp32_helper is not None and esp32_connected and esp32_ip is not None:
+                esp32_helper.disconnect(esp32_ip, esp32_port)
+        except Exception:
+            logger.debug("Error disconnecting ESP32-CAM", exc_info=True)
 
         try:
             if app_cfg.display:
