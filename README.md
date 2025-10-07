@@ -1,12 +1,13 @@
 ## Touchless Lock System (TLS)
 
-Computer‑vision palm verification pipeline for a touchless door lock. Streams video, detects palms with MediaPipe, extracts robust LBP+geometry features, and verifies against registered users. Optional ESP32 signaling can unlock a door on successful verification.
+Computer‑vision palm verification pipeline for a touchless door lock. Streams video, detects palms with MediaPipe, extracts robust LBP+geometry features, and verifies against registered users. Now includes a modern FastAPI web interface for palm snapshot collection.
 
 ### Highlights
+- **FastAPI Web Server**: Modern web interface for palm detection and collection
 - Real‑time palm detection with MediaPipe Hands
 - Tiled‑LBP features plus optional palm‑geometry descriptors
 - Registration and verification flows with similarity matching
-- Snapshot saving for ROIs and extracted features when enabled
+- Snapshot collection via HTTP endpoints
 - Modular, testable design
 
 ---
@@ -30,12 +31,182 @@ pip install -r requirements.txt
 ```
 
 ### Run
+
+**Web Server Mode (Recommended):**
+
+*Local Mode (localhost only):*
 ```bash
+python launcher.py web
+# or
+python web_server.py
+```
+Then open your browser to: http://localhost:8000
+
+*Network Mode (accessible from other devices):*
+```bash
+python launcher.py web --network
+# Auto-detects your local IP and makes server accessible from other devices
+# Access from other devices: http://YOUR_AUTO_DETECTED_IP:8000
+```
+
+```
+
+*Windows Easy Start:*
+```bash
+start_network_server.bat
+```
+
+**Desktop Mode (Legacy):**
+```bash
+python launcher.py desktop
+# or
 python main.py
 ```
 Keys:
 - q: Quit
 - r: Start registration flow
+- v: Start verification flow
+
+---
+
+## Network Configuration
+
+### Quick Network Setup
+
+**Option 1: Automatic Setup (Windows)**
+```bash
+start_network_server.bat
+```
+
+**Option 2: Manual Setup**
+```bash
+# Check your network configuration
+python network_config.py
+
+# Start with auto-detected IP (recommended)
+python launcher.py web --network
+
+# Or specify IP manually
+python launcher.py web --network --host YOUR_LOCAL_IP
+```
+
+### Access URLs
+
+- **Local:** http://localhost:8000
+- **Network (share this):** http://YOUR_LOCAL_IP:8000
+
+### Firewall Configuration
+
+**Windows:**
+```bash
+# Allow port 8000 through Windows Firewall
+netsh advfirewall firewall add rule name="TLS Web Server" dir=in action=allow protocol=TCP localport=8000
+```
+
+**Linux:**
+```bash
+# Allow port 8000 through UFW
+sudo ufw allow 8000
+```
+
+## ESP32 Integration (Endpoints)
+
+The ESP32 acts as a client and communicates with the Python FastAPI server.
+
+### Flow Overview
+- Default mode is verification.
+- Registration mode can be switched via an endpoint (from the Web UI or the ESP32).
+- Snapshots are collected until 5 are received, then a decision is returned in the response to the 5th POST.
+- The Web UI shows live preview and thumbnails of recent annotated frames.
+
+### Endpoints
+
+1) POST `/esp32/hello`
+- Headers: `Content-Type: application/json`
+- Body:
+```
+{"deviceId":"cam1"}
+```
+- Response:
+```
+{"ok":true,"mode":"verification","targetSnapshots":5}
+```
+
+2) POST `/esp32/snapshot`
+- Headers: `Content-Type: application/json`
+- Body (send one image per request):
+```
+{"deviceId":"cam1","image":"data:image/jpeg;base64,BASE64_BYTES"}
+```
+- Responses:
+  - While collecting (1–4):
+```
+{"ok":true,"completed":false,"received":n,"target":5}
+```
+  - On the 5th (decision returned here):
+    - Verification:
+```
+{"ok":true,"completed":true,"action":"verify","result":"granted","userId":123,"name":"Alice"}
+```
+```
+{"ok":true,"completed":true,"action":"verify","result":"denied"}
+```
+    - Registration:
+```
+{"ok":true,"completed":true,"action":"register","result":"success","userId":123,"message":"Registration successful for Alice"}
+```
+```
+{"ok":false,"completed":true,"action":"register","result":"failed","message":"Registration failed"}
+```
+
+3) POST `/mode/registration`
+- Switch to registration mode for the device; clears counters.
+- Body:
+```
+{"deviceId":"cam1","userName":"Alice"}
+```
+- Response:
+```
+{"ok":true,"mode":"registration","targetSnapshots":5}
+```
+
+4) POST `/mode/verification`
+- Switch back to verification mode for the device; clears counters.
+- Body:
+```
+{"deviceId":"cam1"}
+```
+- Response:
+```
+{"ok":true,"mode":"verification","targetSnapshots":5}
+```
+
+5) GET `/status`
+- Returns current UI-driving info:
+```
+{
+  "uiEnabled": true,
+  "activeDeviceId": "cam1",
+  "mode": "verification",
+  "snapshotsCollected": 3,
+  "targetSnapshots": 5,
+  "lastResult": null,
+  "lastAnnotatedImage": "data:image/jpeg;base64,...",
+  "recentAnnotatedImages": ["data:image/jpeg;base64,...", ...]
+}
+```
+
+### ESP32 Client Pseudocode
+```
+POST /esp32/hello { deviceId }
+for i in 1..5:
+  POST /esp32/snapshot { deviceId, image: dataUrl }
+  if response.completed == true:
+    if response.action == 'verify' and response.result == 'granted': unlock
+    else if response.action == 'register' and response.result == 'success': show success
+    else: deny/fail
+    break
+```
 
 ---
 
@@ -64,7 +235,9 @@ Notes:
 ## Project Structure
 ```
 TLS/
-  main.py                 # App entry; orchestrates camera, detector, flows, UI
+  launcher.py             # Main launcher script (web/desktop modes)
+  web_server.py           # FastAPI web server for palm snapshot collection
+  main.py                 # Desktop app entry; orchestrates camera, detector, flows, UI
   camera.py               # VideoCapture wrapper integrating detection per frame
   detector.py             # MediaPipe-based palm detector + ROI builder
   preprocessing.py        # Optional ROI preprocessing helper (if present)
