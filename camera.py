@@ -34,7 +34,8 @@ class VideoCapture:
     def __init__(self, source: Union[int, str] = 0, width: Optional[int] = None, 
                  height: Optional[int] = None, buffer_size: Optional[int] = None,
                  detector: Optional[PalmDetector] = None,
-                 save_snaps: bool = False, snaps_dir: Optional[str] = None) -> None:
+                 save_snaps: bool = False, snaps_dir: Optional[str] = None,
+                 user_name: Optional[str] = None) -> None:
         self.source: Union[int, str] = source
         self.width: Optional[int] = width
         self.height: Optional[int] = height
@@ -43,6 +44,7 @@ class VideoCapture:
         self._cap: Optional[cv2.VideoCapture] = None
         self.save_snaps: bool = save_snaps
         self.snaps_dir: str = snaps_dir or "snapshots"
+        self.user_name: Optional[str] = user_name
         # Snapshot delay mechanism
         self._hand_detected_time: Optional[float] = None
         self._snapshot_delay: float = 0.5  # 0.5 seconds delay
@@ -116,7 +118,14 @@ class VideoCapture:
                 elif not self._snapshot_taken and (current_time - self._hand_detected_time) >= self._snapshot_delay:
                     # Delay has passed, take snapshot
                     try:
-                        os.makedirs(self.snaps_dir, exist_ok=True)
+                        # Create user-specific directory if user_name is provided
+                        if self.user_name:
+                            user_snaps_dir = os.path.join(self.snaps_dir, self.user_name)
+                            os.makedirs(user_snaps_dir, exist_ok=True)
+                        else:
+                            user_snaps_dir = self.snaps_dir
+                            os.makedirs(user_snaps_dir, exist_ok=True)
+                        
                         ts_ms = int(current_time * 1000)
                         for idx, det in enumerate(detections):
                             x, y, w, h = det.bbox
@@ -124,20 +133,27 @@ class VideoCapture:
                             orig_roi = frame[y:y2, x:x2]
                             hand = det.handedness or "Unknown"
                             base = f"{ts_ms}_{idx}_{hand}"
-                            # Save original ROI (BGR)
+                            
+                            # Save original ROI (BGR) - this will replace any existing file
                             try:
-                                cv2.imwrite(os.path.join(self.snaps_dir, f"roi_{base}.png"), orig_roi)
-                            except Exception:
-                                logger.debug("Failed to save original ROI snapshot")
-                            # Save 96x96 grayscale
+                                roi_path = os.path.join(user_snaps_dir, f"roi_{base}.png")
+                                cv2.imwrite(roi_path, orig_roi)
+                                logger.debug(f"Saved original ROI snapshot: {roi_path}")
+                            except Exception as e:
+                                logger.debug(f"Failed to save original ROI snapshot: {e}")
+                            
+                            # Save 96x96 grayscale - this will replace any existing file
                             try:
-                                cv2.imwrite(os.path.join(self.snaps_dir, f"roi96_{base}.png"), det.palm_roi)
-                            except Exception:
-                                logger.debug("Failed to save 96x96 ROI snapshot")
+                                roi96_path = os.path.join(user_snaps_dir, f"roi96_{base}.png")
+                                cv2.imwrite(roi96_path, det.palm_roi)
+                                logger.debug(f"Saved 96x96 ROI snapshot: {roi96_path}")
+                            except Exception as e:
+                                logger.debug(f"Failed to save 96x96 ROI snapshot: {e}")
+                        
                         self._snapshot_taken = True
                         logger.debug("Snapshot taken after 0.5s delay")
-                    except Exception:
-                        logger.debug("Snapshot saving failed")
+                    except Exception as e:
+                        logger.debug(f"Snapshot saving failed: {e}")
             elif not detections and self._hand_detected_time is not None:
                 # No hand detected, reset the timer
                 self._hand_detected_time = None
@@ -148,6 +164,11 @@ class VideoCapture:
         except Exception as e:
             logger.error("Palm detection failed: %s", e)
             return True, frame, []
+
+    def set_user_name(self, user_name: Optional[str]) -> None:
+        """Set the user name for snapshot saving."""
+        self.user_name = user_name
+        logger.debug(f"User name set to: {user_name}")
 
     def release(self) -> None:
         """Release the video resource."""

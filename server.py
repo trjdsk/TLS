@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import base64
 import io
+import os
+import time
 
 from utils import config
 from detector import PalmDetector, DetectorConfig, PalmDetection
@@ -53,9 +55,13 @@ class DeviceState(BaseModel):
     userId: Optional[int] = None
     name: Optional[str] = None
     pendingRegistrationName: Optional[str] = None
+    awaitingName: bool = False
+    lastAction: Optional[str] = None      # 'verify' | 'register'
+    lastResult: Optional[str] = None      # 'granted' | 'denied' | 'pending_name' | 'success' | 'failure'
+    lastMessage: Optional[str] = None
 
 
-VERIFICATION_TARGET = 1
+VERIFICATION_TARGET = 5
 REGISTRATION_TARGET = 10
 
 
@@ -68,6 +74,9 @@ _registrar: Optional[PalmRegistrar] = None
 _devices: Dict[str, DeviceState] = {}
 _device_buffers: Dict[str, List[PalmDetection]] = {}
 _latest_snapshots: Dict[str, str] = {}  # device_id -> base64 encoded image
+_snapshot_timers: Dict[str, float] = {}  # device_id -> last hand detection time
+_snapshot_taken: Dict[str, bool] = {}  # device_id -> whether snapshot was taken
+_verify_cooldown_until: Dict[str, float] = {}  # device_id -> timestamp until which verification is cooling down
 
 
 def _get_detector() -> PalmDetector:
@@ -104,7 +113,55 @@ def _reset_for_mode(state: DeviceState, mode: Mode, device_id: str) -> None:
     state.target = VERIFICATION_TARGET if mode == "verification" else REGISTRATION_TARGET
     state.userId = None
     state.name = None
+    state.awaitingName = False
     _device_buffers[device_id] = []
+    # Reset snapshot timers
+    _snapshot_timers[device_id] = 0
+    _snapshot_taken[device_id] = False
+
+
+def _save_snapshots(device_id: str, frame: np.ndarray, detections: List[PalmDetection], user_name: Optional[str] = None) -> None:
+    """Save snapshots with user-specific folders."""
+    try:
+        # Create base snapshots directory
+        snaps_dir = "snapshots"
+        os.makedirs(snaps_dir, exist_ok=True)
+        
+        # Create user-specific directory if user_name is provided
+        if user_name:
+            user_snaps_dir = os.path.join(snaps_dir, user_name)
+            os.makedirs(user_snaps_dir, exist_ok=True)
+        else:
+            user_snaps_dir = snaps_dir
+        
+        current_time = time.time()
+        ts_ms = int(current_time * 1000)
+        
+        for idx, det in enumerate(detections):
+            x, y, w, h = det.bbox
+            x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
+            orig_roi = frame[y:y2, x:x2]
+            hand = det.handedness or "Unknown"
+            base = f"{ts_ms}_{idx}_{hand}"
+            
+            # Save original ROI (BGR) - this will replace any existing file
+            try:
+                roi_path = os.path.join(user_snaps_dir, f"roi_{base}.png")
+                cv2.imwrite(roi_path, orig_roi)
+                logger.debug(f"Saved original ROI snapshot: {roi_path}")
+            except Exception as e:
+                logger.debug(f"Failed to save original ROI snapshot: {e}")
+            
+            # Save 96x96 grayscale - this will replace any existing file
+            try:
+                roi96_path = os.path.join(user_snaps_dir, f"roi96_{base}.png")
+                cv2.imwrite(roi96_path, det.palm_roi)
+                logger.debug(f"Saved 96x96 ROI snapshot: {roi96_path}")
+            except Exception as e:
+                logger.debug(f"Failed to save 96x96 ROI snapshot: {e}")
+                
+    except Exception as e:
+        logger.debug(f"Snapshot saving failed: {e}")
 
 
 @app.post("/esp32/hello")
@@ -140,6 +197,7 @@ async def set_mode_registration(body: ModeRegistrationBody):
     st = _ensure_device(body.deviceId)
     _reset_for_mode(st, "registration", body.deviceId)
     st.pendingRegistrationName = (body.userName or None)
+    st.awaitingName = False
     return {
         "ok": True, 
         "mode": st.mode,
@@ -192,11 +250,86 @@ async def esp32_snapshot(
 
     palm_detected = bool(detections)
 
-    # Count only when palm_detected == True
+    # Handle snapshot saving with delay mechanism
     if palm_detected:
-        st.received += 1
-        # Accumulate the strongest or first detection for downstream processing
-        _device_buffers[x_device_id].append(detections[0])
+        current_time = time.time()
+        snapshot_delay = 0.5  # 0.5 seconds delay
+        
+        # Initialize timer if this is the first detection
+        if x_device_id not in _snapshot_timers:
+            _snapshot_timers[x_device_id] = current_time
+            _snapshot_taken[x_device_id] = False
+        
+        # Check if enough time has passed and snapshot not taken yet
+        if not _snapshot_taken.get(x_device_id, False) and (current_time - _snapshot_timers[x_device_id]) >= snapshot_delay:
+            # Save snapshots with user name if available
+            user_name = st.name if st.name else None
+            _save_snapshots(x_device_id, frame, detections, user_name)
+            _snapshot_taken[x_device_id] = True
+            logger.debug(f"Snapshot taken for device {x_device_id} with user {user_name}")
+    else:
+        # No hand detected, reset the timer
+        if x_device_id in _snapshot_timers:
+            _snapshot_timers[x_device_id] = 0
+            _snapshot_taken[x_device_id] = False
+
+    # Cooldown gate for verification attempts
+    now_ts = time.time()
+    if st.mode == "verification":
+        until = _verify_cooldown_until.get(x_device_id, 0.0)
+        if now_ts < until:
+            remaining = max(0.0, until - now_ts)
+            st.lastAction = "verify"
+            st.lastResult = "info"
+            st.lastMessage = f"Cooldown: {remaining:.1f}s remaining"
+            return JSONResponse({
+                "ok": True,
+                "palm_detected": palm_detected,
+                "completed": False,
+                "received": st.received,
+                "target": st.target,
+                "cooldown": remaining,
+            })
+
+    # Count only when palm_detected == True and gates pass
+    if palm_detected:
+        # Use the strongest/first detection
+        det = detections[0]
+        # Palm-facing gate (reuse simple normal check similar to desktop fallback)
+        palm_ok = True
+        try:
+            lms = getattr(det, "landmarks", None)
+            if lms is not None and hasattr(lms, "landmark"):
+                # approximate facing using cross/forward angle like desktop fallback
+                p0 = np.array([lms.landmark[0].x, lms.landmark[0].y, lms.landmark[0].z])
+                p5 = np.array([lms.landmark[5].x, lms.landmark[5].y, lms.landmark[5].z])
+                p17 = np.array([lms.landmark[17].x, lms.landmark[17].y, lms.landmark[17].z])
+                v1 = p5 - p0
+                v2 = p17 - p0
+                normal = np.cross(v1, v2)
+                forward = np.array([lms.landmark[9].x, lms.landmark[9].y, lms.landmark[9].z]) - p0
+                cos_angle = float(np.dot(normal, forward)) / (float(np.linalg.norm(normal) * np.linalg.norm(forward)) + 1e-8)
+                palm_ok = (cos_angle > -0.3)
+        except Exception:
+            palm_ok = True
+
+        # Quality gate: require non-empty ROI and minimal size
+        quality_ok = True
+        try:
+            roi = getattr(det, "palm_roi", None)
+            if roi is None or roi.size == 0:
+                quality_ok = False
+            else:
+                h, w = roi.shape[:2]
+                quality_ok = (h >= 48 and w >= 48)
+        except Exception:
+            quality_ok = True
+
+        if palm_ok and quality_ok:
+            # If registration is awaiting a name, freeze the counters to keep UI state stable
+            if not (st.mode == "registration" and st.awaitingName):
+                st.received += 1
+                _device_buffers[x_device_id].append(det)
 
     completed = st.received >= st.target
     
@@ -221,6 +354,11 @@ async def esp32_snapshot(
                 user_id = matched_user_id if is_match else None
                 name = matched_name if is_match else None
                 st.received = 0  # Reset for next cycle
+                # Start a brief cooldown after verification (match desktop behavior)
+                _verify_cooldown_until[x_device_id] = time.time() + config.VERIFICATION_COOLDOWN_SECONDS
+                st.lastAction = "verify"
+                st.lastResult = result
+                st.lastMessage = (f"Access Granted: {name}" if is_match else "Access Denied")
                 return JSONResponse({
                     **base,
                     "action": "verify",
@@ -229,20 +367,17 @@ async def esp32_snapshot(
                     "name": name,
                 })
             else:
-                registrar = _get_registrar()
-                user_name = st.pendingRegistrationName or "Unknown"
-                success, user_id = registrar.register_user_with_features(
-                    buffer,
-                    name=user_name,
-                    handedness=None,
-                )
-                st.received = 0  # Reset for next cycle
+                # Registration complete: wait for user-provided name via UI.
+                # Do not reset counters; set awaitingName for UI to show modal.
+                st.awaitingName = True
+                st.lastAction = "register"
+                st.lastResult = "pending_name"
+                st.lastMessage = "Registration complete, waiting for name"
                 return JSONResponse({
                     **base,
                     "action": "register",
-                    "result": "success" if success else "failure",
-                    "userId": user_id if success else None,
-                    "message": "Registered" if success else "Registration failed",
+                    "result": "pending_name",
+                    "message": "Registration complete, waiting for name",
                 })
         except Exception as exc:
             logger.exception("Post-processing failed: %s", exc)
@@ -378,12 +513,15 @@ async def web_ui():
                 }
                 
                 container.innerHTML = Object.entries(devices).map(([deviceId, device]) => {
-                    // Check if this device just completed registration and needs a name
-                    if (device.mode === 'registration' && device.received >= device.target && !device.pendingRegistrationName && !pendingRegistrationDevice) {
+                    // Show modal when server marks registration as awaiting name
+                    if (device.mode === 'registration' && device.awaitingName && !pendingRegistrationDevice) {
                         pendingRegistrationDevice = deviceId;
-                        setTimeout(() => showNameModal(deviceId), 500); // Small delay to let UI update
+                        setTimeout(() => showNameModal(deviceId), 300); // Small delay to let UI update
                     }
                     
+                    const banner = (device.awaitingName) ? `<div class="log-entry log-info">Registration completed. Awaiting name...</div>` : '';
+                    const last = (device.lastMessage) ? `<div class="log-entry ${device.lastResult === 'granted' || device.lastResult === 'success' ? 'log-success' : (device.lastResult === 'denied' || device.lastResult === 'failure' ? 'log-error' : 'log-info')}">${device.lastMessage}</div>` : '';
+
                     return `
                         <div class="device-card">
                             <div class="device-id">📱 ${deviceId}</div>
@@ -391,6 +529,7 @@ async def web_ui():
                                 <span class="mode ${device.mode}">${device.mode.toUpperCase()}</span>
                                 <span>Received: ${device.received}/${device.target}</span>
                             </div>
+                            ${banner}
                             <div class="progress">
                                 <div class="progress-bar">
                                     <div class="progress-fill" style="width: ${(device.received / device.target) * 100}%"></div>
@@ -401,6 +540,7 @@ async def web_ui():
                                     <img src="data:image/jpeg;base64,${device.latestSnapshot}" alt="Latest snapshot">
                                 </div>
                             ` : '<div class="no-snapshot">No snapshot available</div>'}
+                            ${last}
                             <div class="controls">
                                 <button class="btn btn-primary" onclick="setMode('${deviceId}', 'verification')">Set Verification</button>
                                 <button class="btn btn-warning" onclick="setMode('${deviceId}', 'registration')">Set Registration</button>
@@ -516,6 +656,10 @@ async def get_devices():
             "userId": state.userId,
             "name": state.name,
             "pendingRegistrationName": state.pendingRegistrationName,
+            "awaitingName": state.awaitingName,
+            "lastAction": state.lastAction,
+            "lastResult": state.lastResult,
+            "lastMessage": state.lastMessage,
             "latestSnapshot": _latest_snapshots.get(device_id)
         }
     return devices
@@ -531,6 +675,38 @@ async def submit_name(body: NameSubmissionBody):
     """Submit name for registration completion."""
     st = _ensure_device(body.deviceId)
     st.pendingRegistrationName = body.userName
-    return {"ok": True, "message": "Name submitted for registration"}
+    
+    # Get the stored detections for this device
+    buffer = _device_buffers.get(body.deviceId, [])
+    if not buffer:
+        return {"ok": False, "message": "No registration data available"}
+    
+    try:
+        registrar = _get_registrar()
+        success, user_id = registrar.register_user_with_features(
+            buffer,
+            name=body.userName,
+            handedness=None,
+        )
+        
+        if success:
+            st.userId = user_id
+            st.name = body.userName
+            st.pendingRegistrationName = None
+            st.awaitingName = False
+            st.received = 0
+            _device_buffers[body.deviceId] = []
+            st.lastAction = "register"
+            st.lastResult = "success"
+            st.lastMessage = f"Registered {body.userName}"
+            return {"ok": True, "message": f"Registration successful for {body.userName}", "userId": user_id}
+        else:
+            st.lastAction = "register"
+            st.lastResult = "failure"
+            st.lastMessage = "Registration failed"
+            return {"ok": False, "message": "Registration failed"}
+    except Exception as exc:
+        logger.exception("Registration processing failed: %s", exc)
+        return {"ok": False, "message": "Registration processing failed"}
 
 

@@ -297,6 +297,8 @@ def main() -> None:
                                 if success_reg:
                                     status_text = f"Registration successful for {user_name}!"
                                     print_status(f"Registration successful for {user_name} ({registration_handedness or 'Right'} hand)!")
+                                    # Set user name for future snapshots
+                                    cap.set_user_name(user_name)
                                 else:
                                     status_text = "Registration failed"
                                     print_status("Registration failed")
@@ -378,6 +380,8 @@ def main() -> None:
                 registering = True
                 registration_detections.clear()
                 registration_handedness = None
+                # Clear user name for new registration
+                cap.set_user_name(None)
                 status_text = "Registration started. Show your palm..."
                 print_status(status_text)
             elif key == ord("c") and registering:
