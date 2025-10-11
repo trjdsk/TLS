@@ -28,7 +28,18 @@ class LBPExtractor:
         if img is None or img.size == 0:
             raise ValueError("Empty image")
         if img.ndim == 3 and img.shape[2] == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # ESP32-CAM optimized grayscale conversion
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Enhanced preprocessing for ESP32-CAM JPEG quality
+            # Apply bilateral filter to reduce noise while preserving edges
+            gray = cv2.bilateralFilter(gray, 9, 75, 75)
+            
+            # Apply unsharp masking to enhance texture details
+            gaussian = cv2.GaussianBlur(gray, (0, 0), 2.0)
+            gray = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+            
+            return gray
         return img.copy()
 
     def _lbp_img(self, gray: np.ndarray) -> np.ndarray:
@@ -65,6 +76,10 @@ class LBPExtractor:
             gray = cv2.resize(gray, (max(32, w), max(32, h)), interpolation=cv2.INTER_LINEAR)
             h, w = gray.shape[:2]
 
+        # ESP32-CAM specific: Apply additional preprocessing for better LBP
+        # Normalize intensity to improve feature consistency
+        gray = cv2.equalizeHist(gray)
+        
         lbp = self._lbp_img(gray)
         rows, cols = self.grid
         tile_h = lbp.shape[0] // rows

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from typing import Dict, List, Optional, Literal
+import sqlite3
 
 import numpy as np
 import cv2
@@ -226,11 +227,27 @@ async def esp32_snapshot(
     if not body_bytes:
         raise HTTPException(status_code=400, detail="Empty snapshot body")
 
-    # Decode JPEG -> BGR image
+    # Decode JPEG -> BGR image with ESP32-CAM optimizations
     np_buf = np.frombuffer(body_bytes, dtype=np.uint8)
     frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
     if frame is None or frame.size == 0:
         raise HTTPException(status_code=400, detail="Invalid JPEG data")
+    
+    # ESP32-CAM specific image enhancement
+    if frame.ndim == 3 and frame.shape[2] == 3:
+        # Apply sharpening to compensate for JPEG compression blur
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        frame = cv2.filter2D(frame, -1, kernel)
+        
+        # Enhance contrast for better feature extraction
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        frame = cv2.merge([l, a, b])
+        frame = cv2.cvtColor(frame, cv2.COLOR_LAB2BGR)
+    
+    logger.debug(f"ESP32-CAM JPEG decoded and enhanced, shape: {frame.shape}, dtype: {frame.dtype}")
     
     # Store latest snapshot for UI
     try:
@@ -244,6 +261,7 @@ async def esp32_snapshot(
     detector = _get_detector()
     try:
         _, detections = detector.detect(frame)
+        logger.debug(f"Palm detection completed: {len(detections)} detections found")
     except Exception as exc:
         logger.exception("Detection failed: %s", exc)
         detections = []
@@ -295,41 +313,56 @@ async def esp32_snapshot(
     if palm_detected:
         # Use the strongest/first detection
         det = detections[0]
-        # Palm-facing gate (reuse simple normal check similar to desktop fallback)
-        palm_ok = True
+        
+        # Enhanced palm-facing validation (same as Windows version)
+        palm_ok = False
         try:
             lms = getattr(det, "landmarks", None)
             if lms is not None and hasattr(lms, "landmark"):
-                # approximate facing using cross/forward angle like desktop fallback
-                p0 = np.array([lms.landmark[0].x, lms.landmark[0].y, lms.landmark[0].z])
-                p5 = np.array([lms.landmark[5].x, lms.landmark[5].y, lms.landmark[5].z])
-                p17 = np.array([lms.landmark[17].x, lms.landmark[17].y, lms.landmark[17].z])
-                v1 = p5 - p0
-                v2 = p17 - p0
-                normal = np.cross(v1, v2)
-                forward = np.array([lms.landmark[9].x, lms.landmark[9].y, lms.landmark[9].z]) - p0
-                cos_angle = float(np.dot(normal, forward)) / (float(np.linalg.norm(normal) * np.linalg.norm(forward)) + 1e-8)
-                palm_ok = (cos_angle > -0.3)
+                # Use the same strong validation as Windows version
+                from utils.palm import is_palm_facing_camera
+                try:
+                    palm_ok = is_palm_facing_camera(lms)
+                except Exception:
+                    # Fallback to simplified check if main validation fails
+                    p0 = np.array([lms.landmark[0].x, lms.landmark[0].y, lms.landmark[0].z])
+                    p5 = np.array([lms.landmark[5].x, lms.landmark[5].y, lms.landmark[5].z])
+                    p17 = np.array([lms.landmark[17].x, lms.landmark[17].y, lms.landmark[17].z])
+                    v1 = p5 - p0
+                    v2 = p17 - p0
+                    normal = np.cross(v1, v2)
+                    forward = np.array([lms.landmark[9].x, lms.landmark[9].y, lms.landmark[9].z]) - p0
+                    cos_angle = float(np.dot(normal, forward)) / (float(np.linalg.norm(normal) * np.linalg.norm(forward)) + 1e-8)
+                    palm_ok = (cos_angle > -0.3)
         except Exception:
-            palm_ok = True
+            palm_ok = False
 
-        # Quality gate: require non-empty ROI and minimal size
-        quality_ok = True
+        # Enhanced quality gates (same as Windows version)
+        quality_ok = False
         try:
             roi = getattr(det, "palm_roi", None)
-            if roi is None or roi.size == 0:
-                quality_ok = False
-            else:
+            if roi is not None and roi.size > 0:
                 h, w = roi.shape[:2]
-                quality_ok = (h >= 48 and w >= 48)
+                # More stringent quality requirements
+                quality_ok = (h >= 64 and w >= 64)  # Increased from 48x48
+                
+                # ESP32-CAM specific quality check: variance threshold
+                if quality_ok:
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+                    variance = np.var(gray_roi)
+                    # Lower variance threshold for ESP32-CAM due to JPEG compression
+                    quality_ok = variance >= 50  # Reduced from 100 for ESP32-CAM
         except Exception:
-            quality_ok = True
+            quality_ok = False
 
         if palm_ok and quality_ok:
             # If registration is awaiting a name, freeze the counters to keep UI state stable
             if not (st.mode == "registration" and st.awaitingName):
                 st.received += 1
                 _device_buffers[x_device_id].append(det)
+                logger.debug(f"Valid detection added for {x_device_id}: palm_ok={palm_ok}, quality_ok={quality_ok}")
+        else:
+            logger.debug(f"Detection rejected for {x_device_id}: palm_ok={palm_ok}, quality_ok={quality_ok}")
 
     completed = st.received >= st.target
     
@@ -344,15 +377,32 @@ async def esp32_snapshot(
         try:
             buffer = _device_buffers.get(x_device_id, [])
             if st.mode == "verification":
+                logger.info(f"Running verification for device {x_device_id} with {len(buffer)} detections")
+                
+                # ESP32-CAM optimized verification thresholds
+                # Use lower similarity threshold to account for JPEG quality loss
+                esp32_threshold = config.ESP32_SIMILARITY_THRESHOLD
+                
+                # Extract handedness from current detections for verification
+                current_handedness = None
+                if buffer:
+                    for detection in buffer:
+                        if detection.handedness and detection.handedness != "Unknown":
+                            current_handedness = detection.handedness
+                            break
+                
+                logger.info(f"HANDEDNESS DEBUG: Current detection handedness: {current_handedness}")
+                
                 is_match, matched_user_id, matched_name = verify_palm_with_features(
                     buffer,
-                    handedness=None,
+                    handedness=current_handedness,
                     use_geometry=config.DEFAULT_USE_GEOMETRY,
-                    similarity_threshold=config.DEFAULT_SIMILARITY_THRESHOLD,
+                    similarity_threshold=esp32_threshold,
                 )
                 result = "granted" if is_match else "denied"
                 user_id = matched_user_id if is_match else None
                 name = matched_name if is_match else None
+                logger.info(f"ESP32-CAM verification result for {x_device_id}: {result} (user: {name}, threshold: {esp32_threshold:.3f})")
                 st.received = 0  # Reset for next cycle
                 # Start a brief cooldown after verification (match desktop behavior)
                 _verify_cooldown_until[x_device_id] = time.time() + config.VERIFICATION_COOLDOWN_SECONDS
@@ -393,6 +443,51 @@ async def esp32_snapshot(
 @app.get("/")
 async def root():
     return {"service": "touchless_lock_system", "status": "ok"}
+
+
+@app.get("/api/debug/users")
+async def debug_users():
+    """Debug endpoint to check database structure and users."""
+    try:
+        import db
+        cur = db.db.cursor()
+        
+        # Check what tables exist
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cur.fetchall()
+        
+        # Check users table structure
+        cur.execute("PRAGMA table_info(users)")
+        users_schema = cur.fetchall()
+        
+        # Get all users
+        cur.execute("SELECT * FROM users")
+        all_users = cur.fetchall()
+        
+        return {
+            "tables": [dict(t) for t in tables],
+            "users_schema": [dict(s) for s in users_schema],
+            "all_users": [dict(u) for u in all_users],
+            "user_count": len(all_users)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/debug/verification")
+async def debug_verification():
+    """Debug endpoint to check verification configuration."""
+    try:
+        from utils import config
+        return {
+            "default_similarity_threshold": config.DEFAULT_SIMILARITY_THRESHOLD,
+            "esp32_similarity_threshold": config.ESP32_SIMILARITY_THRESHOLD,
+            "variance_threshold": config.VARIANCE_THRESHOLD,
+            "esp32_variance_threshold": config.ESP32_VARIANCE_THRESHOLD,
+            "use_geometry": config.DEFAULT_USE_GEOMETRY
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/ui", response_class=HTMLResponse)
@@ -440,6 +535,19 @@ async def web_ui():
             .close:hover { color: #000; }
             .name-input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; font-size: 16px; }
             .modal-buttons { text-align: right; margin-top: 15px; }
+            .header-controls { margin: 15px 0; }
+            .header-controls .btn { margin: 5px; }
+            .user-management { display: none; }
+            .user-management.active { display: block; }
+            .user-card { border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; background: #fafafa; }
+            .user-info { display: flex; justify-content: space-between; align-items: center; }
+            .user-details { flex: 1; }
+            .user-actions { display: flex; gap: 10px; }
+            .btn-danger { background: #f44336; color: white; }
+            .btn-info { background: #2196f3; color: white; }
+            .user-stats { font-size: 12px; color: #666; margin-top: 5px; }
+            .template-list { margin-top: 10px; font-size: 12px; }
+            .template-item { padding: 5px; background: #f0f0f0; margin: 2px 0; border-radius: 4px; }
         </style>
     </head>
     <body>
@@ -448,6 +556,10 @@ async def web_ui():
             <div class="header">
                 <h1>🔐 Touchless Lock System</h1>
                 <p>Real-time device monitoring and control</p>
+                <div class="header-controls">
+                    <button class="btn btn-primary" onclick="showUserManagement()">👥 User Management</button>
+                    <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
+                </div>
             </div>
             <div id="devices" class="devices">
                 <div class="device-card">
@@ -457,6 +569,17 @@ async def web_ui():
             </div>
             <div class="log" id="log">
                 <div class="log-entry log-info">System started. Waiting for device connections...</div>
+            </div>
+            
+            <!-- User Management Section -->
+            <div id="userManagement" class="user-management">
+                <div class="header">
+                    <h2>👥 User Management</h2>
+                    <button class="btn btn-primary" onclick="showDevices()">← Back to Devices</button>
+                </div>
+                <div id="usersList">
+                    <div class="log-entry log-info">Loading users...</div>
+                </div>
             </div>
         </div>
 
@@ -479,6 +602,7 @@ async def web_ui():
         <script>
             let refreshInterval;
             let pendingRegistrationDevice = null;
+            let currentView = 'devices'; // 'devices' or 'users'
             
             function log(message, type = 'info') {
                 const logDiv = document.getElementById('log');
@@ -491,12 +615,121 @@ async def web_ui():
             
             async function refreshData() {
                 try {
-                    const response = await fetch('/api/devices');
-                    const data = await response.json();
-                    updateDevices(data);
+                    if (currentView === 'devices') {
+                        const response = await fetch('/api/devices');
+                        const data = await response.json();
+                        updateDevices(data);
+                    } else if (currentView === 'users') {
+                        await loadUsers();
+                    }
                 } catch (error) {
                     log(`Error fetching data: ${error.message}`, 'error');
                 }
+            }
+            
+            async function loadUsers() {
+                try {
+                    log('Loading users...', 'info');
+                    const response = await fetch('/api/users');
+                    const data = await response.json();
+                    log(`Users API response: ${JSON.stringify(data)}`, 'info');
+                    updateUsers(data.users || []);
+                } catch (error) {
+                    log(`Error loading users: ${error.message}`, 'error');
+                    document.getElementById('usersList').innerHTML = '<div class="log-entry log-error">Failed to load users</div>';
+                }
+            }
+            
+            function updateUsers(users) {
+                const container = document.getElementById('usersList');
+                
+                if (users.length === 0) {
+                    container.innerHTML = '<div class="log-entry log-info">No users registered yet</div>';
+                    return;
+                }
+                
+                container.innerHTML = users.map(user => `
+                    <div class="user-card">
+                        <div class="user-info">
+                            <div class="user-details">
+                                <div><strong>${user.name}</strong></div>
+                                <div class="user-stats">
+                                    ID: ${user.id} | Registered: ${new Date(user.created_at).toLocaleString()}
+                                </div>
+                            </div>
+                            <div class="user-actions">
+                                <button class="btn btn-info" onclick="showUserInfo(${user.id})">ℹ️ Info</button>
+                                <button class="btn btn-danger" onclick="deleteUser(${user.id}, '${user.name}')">🗑️ Delete</button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            async function showUserInfo(userId) {
+                try {
+                    const response = await fetch(`/api/users/${userId}/info`);
+                    const data = await response.json();
+                    
+                    if (data.ok) {
+                        const user = data.user;
+                        const templatesHtml = user.templates.map(t => 
+                            `<div class="template-item">
+                                Template ${t.id} (${t.handedness}) - ${new Date(t.created_at).toLocaleString()} 
+                                (${Math.round(t.feature_size/1024)}KB)
+                            </div>`
+                        ).join('');
+                        
+                        alert(`User Information:
+Name: ${user.name}
+ID: ${user.id}
+Registered: ${new Date(user.created_at).toLocaleString()}
+Templates: ${user.template_count}
+
+Template Details:
+${templatesHtml || 'No templates'}`);
+                    } else {
+                        log(`Failed to get user info: ${data.message}`, 'error');
+                    }
+                } catch (error) {
+                    log(`Error getting user info: ${error.message}`, 'error');
+                }
+            }
+            
+            async function deleteUser(userId, userName) {
+                if (!confirm(`Are you sure you want to delete user "${userName}"?\n\nThis will permanently delete the user and all their palm templates.`)) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`/api/users/${userId}`, {
+                        method: 'DELETE'
+                    });
+                    const data = await response.json();
+                    
+                    if (data.ok) {
+                        log(`User "${userName}" deleted successfully`, 'success');
+                        await loadUsers(); // Refresh user list
+                    } else {
+                        log(`Failed to delete user: ${data.message}`, 'error');
+                    }
+                } catch (error) {
+                    log(`Error deleting user: ${error.message}`, 'error');
+                }
+            }
+            
+            function showUserManagement() {
+                currentView = 'users';
+                document.getElementById('devices').style.display = 'none';
+                document.getElementById('userManagement').classList.add('active');
+                loadUsers();
+            }
+            
+            function showDevices() {
+                currentView = 'devices';
+                document.getElementById('devices').style.display = 'block';
+                document.getElementById('userManagement').classList.remove('active');
+                refreshData();
             }
             
             function updateDevices(devices) {
@@ -665,6 +898,130 @@ async def get_devices():
     return devices
 
 
+@app.get("/api/users")
+async def get_users():
+    """Get all registered users."""
+    try:
+        import db
+        cur = db.db.cursor()
+        # Check if created_at column exists, if not use a default
+        try:
+            cur.execute("SELECT id, name, created_at FROM users ORDER BY created_at DESC")
+        except sqlite3.OperationalError:
+            # created_at column doesn't exist, use basic query
+            cur.execute("SELECT id, name FROM users ORDER BY id DESC")
+        
+        users = cur.fetchall()
+        # Convert to list of dicts for JSON serialization
+        user_list = []
+        for user in users:
+            user_dict = dict(user)
+            # Add created_at if it doesn't exist
+            if 'created_at' not in user_dict:
+                user_dict['created_at'] = 'Unknown'
+            user_list.append(user_dict)
+        
+        return {"users": user_list}
+    except Exception as e:
+        logger.exception("Failed to fetch users: %s", e)
+        return {"users": [], "error": str(e)}
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int):
+    """Delete a user and all their templates."""
+    try:
+        import db
+        cur = db.db.cursor()
+        
+        # Get user info before deletion
+        cur.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return {"ok": False, "message": "User not found"}
+        
+        # Delete user templates first
+        cur.execute("DELETE FROM palm_templates WHERE user_id = ?", (user_id,))
+        
+        # Delete user
+        cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        
+        db.db.commit()
+        
+        logger.info(f"Deleted user {user_id} ({user['name']}) and all templates")
+        return {"ok": True, "message": f"User {user['name']} deleted successfully"}
+        
+    except Exception as e:
+        logger.exception("Failed to delete user %s: %s", user_id, e)
+        return {"ok": False, "message": f"Failed to delete user: {str(e)}"}
+
+
+@app.get("/api/users/{user_id}/info")
+async def get_user_info(user_id: int):
+    """Get detailed information about a user."""
+    try:
+        import db
+        cur = db.db.cursor()
+        
+        # Get user basic info - handle missing created_at column
+        try:
+            cur.execute("SELECT id, name, created_at FROM users WHERE id = ?", (user_id,))
+        except sqlite3.OperationalError:
+            cur.execute("SELECT id, name FROM users WHERE id = ?", (user_id,))
+        
+        user = cur.fetchone()
+        if not user:
+            return {"ok": False, "message": "User not found"}
+        
+        user_dict = dict(user)
+        if 'created_at' not in user_dict:
+            user_dict['created_at'] = 'Unknown'
+        
+        # Get template count
+        cur.execute("SELECT COUNT(*) FROM palm_templates WHERE user_id = ?", (user_id,))
+        template_count = cur.fetchone()[0]
+        
+        # Get template details - handle missing created_at column
+        try:
+            cur.execute("""
+                SELECT id, handedness, created_at, 
+                       LENGTH(features) as feature_size
+                FROM palm_templates 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            """, (user_id,))
+        except sqlite3.OperationalError:
+            cur.execute("""
+                SELECT id, handedness, LENGTH(features) as feature_size
+                FROM palm_templates 
+                WHERE user_id = ? 
+                ORDER BY id DESC
+            """, (user_id,))
+        
+        templates = cur.fetchall()
+        template_list = []
+        for template in templates:
+            template_dict = dict(template)
+            if 'created_at' not in template_dict:
+                template_dict['created_at'] = 'Unknown'
+            template_list.append(template_dict)
+        
+        return {
+            "ok": True,
+            "user": {
+                "id": user_dict["id"],
+                "name": user_dict["name"],
+                "created_at": user_dict["created_at"],
+                "template_count": template_count,
+                "templates": template_list
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get user info for %s: %s", user_id, e)
+        return {"ok": False, "message": f"Failed to get user info: {str(e)}"}
+
+
 class NameSubmissionBody(BaseModel):
     deviceId: str
     userName: str
@@ -682,11 +1039,21 @@ async def submit_name(body: NameSubmissionBody):
         return {"ok": False, "message": "No registration data available"}
     
     try:
+        # Extract handedness from the first detection in buffer
+        detected_handedness = None
+        if buffer:
+            for detection in buffer:
+                if detection.handedness and detection.handedness != "Unknown":
+                    detected_handedness = detection.handedness
+                    break
+        
+        logger.info(f"REGISTRATION HANDEDNESS DEBUG: Detected handedness for {body.userName}: {detected_handedness}")
+        
         registrar = _get_registrar()
         success, user_id = registrar.register_user_with_features(
             buffer,
             name=body.userName,
-            handedness=None,
+            handedness=detected_handedness,
         )
         
         if success:

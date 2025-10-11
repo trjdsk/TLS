@@ -109,11 +109,20 @@ class PalmVerifier:
         if not valid_extracted:
             logger.debug("No valid detections for verification")
             return False, 0.0
+            
+        # SECURITY CHECK: Ensure we have high-quality features
+        avg_variance = np.mean([gvar for _, _, gvar, _ in valid_extracted])
+        if avg_variance < self.min_lbp_variance:
+            logger.warning("User %s: Low feature quality (avg_variance=%.4f < %.4f)", user_id, avg_variance, self.min_lbp_variance)
+            return False, 0.0
 
         best_score = -1.0
+        comparison_count = 0
+        
         for tpl_id, tpl_handedness, tpl_features, tpl_ftype in templates:
             tpl_vec = np.asarray(tpl_features).ravel()
             if tpl_vec.size == 0:
+                logger.debug("Empty template vector for user %s template %s", user_id, tpl_id)
                 continue
             for d, feats, gvar, tile_vars in valid_extracted:
                 det_hand = (d.handedness or "").strip()
@@ -121,13 +130,24 @@ class PalmVerifier:
                     logger.debug("Handedness mismatch: det=%s tpl=%s -> skip", det_hand, tpl_handedness)
                     continue
                 sim = cosine_similarity(feats, tpl_vec)
+                comparison_count += 1
+                logger.debug("User %s template %s comparison: sim=%.3f", user_id, tpl_id, sim)
                 if sim > best_score:
                     best_score = sim
 
         if best_score < 0:
+            logger.warning("User %s: No valid comparisons made (comparison_count=%d)", user_id, comparison_count)
             return False, 0.0
+            
         success = best_score >= self.similarity_threshold
-        logger.info("User %s verification result: success=%s score=%.3f", user_id, success, best_score)
+        logger.info("User %s verification result: success=%s score=%.6f (threshold=%.6f, comparisons=%d)", 
+                   user_id, success, best_score, self.similarity_threshold, comparison_count)
+        
+        # DEBUG: Log detailed comparison results
+        if best_score > 0.9:  # Log high scores in detail
+            logger.info(f"HIGH SCORE DEBUG: User {user_id} got score {best_score:.6f} (threshold: {self.similarity_threshold:.6f})")
+            logger.info(f"HIGH SCORE DEBUG: success={success}, comparison_count={comparison_count}")
+        
         return success, float(best_score)
 
 
@@ -149,6 +169,12 @@ def verify_palm_with_features(
         cur = db.db.cursor()
         cur.execute("SELECT id, name FROM users")
         users = cur.fetchall()
+        
+        # SECURITY CHECK: Ensure we have registered users
+        if not users:
+            logger.warning("No registered users found in database - denying access")
+            return False, None, None
+            
     except Exception as e:
         logger.exception("Failed to enumerate users: %s", e)
         return False, None, None
@@ -164,13 +190,28 @@ def verify_palm_with_features(
         except Exception:
             continue
         ok, score = verifier.verify_user(palm_detections, uid)
+        # CRITICAL FIX: Only consider successful verifications
         if ok and score > best_score:
             best_score = score
             best_user_id = uid
             best_user_name = uname
-        elif not ok and score > best_score:
-            best_score = score
+        # REMOVED: The buggy line that was causing false positives
+        # elif not ok and score > best_score:
+        #     best_score = score
 
+    # DEBUG: Log all verification details
+    logger.info(f"VERIFICATION DEBUG: best_user_id={best_user_id}, best_score={best_score:.6f}, threshold={similarity_threshold:.6f}")
+    logger.info(f"VERIFICATION DEBUG: best_user_name={best_user_name}")
+    
+    # CRITICAL SECURITY: Strict 0.975 threshold enforcement
     if best_user_id is not None and best_score >= similarity_threshold:
-        return True, best_user_id, best_user_name
-    return False, None, None
+        # Only accept scores of 0.975 or higher
+        if best_score >= 0.975:
+            logger.info(f"VERIFICATION SUCCESS: Score {best_score:.6f} meets strict 0.975 threshold - granting access to User {best_user_id} ({best_user_name})")
+            return True, best_user_id, best_user_name
+        else:
+            logger.warning(f"Verification rejected: Score {best_score:.6f} below strict 0.975 threshold")
+            return False, None, None
+    else:
+        logger.info(f"Verification failed: best_score={best_score:.6f}, threshold={similarity_threshold:.6f}, user_id={best_user_id}")
+        return False, None, None

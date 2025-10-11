@@ -37,7 +37,7 @@ ROI_SIZE = (96, 96)  # width, height for LBP/geometry extraction
 # Verification / Registration defaults
 # ----------------------
 DEFAULT_USE_GEOMETRY = True
-DEFAULT_SIMILARITY_THRESHOLD = 0.92
+DEFAULT_SIMILARITY_THRESHOLD = 0.975
 REGISTRATION_TARGETS = 10      # number of frames to collect per user registration
 VERIFICATION_TARGETS = 5       # number of frames to collect per verification attempt
 VERIFICATION_COOLDOWN_SECONDS = 2.0  # cooldown after verification
@@ -52,6 +52,11 @@ VARIANCE_THRESHOLD = 0.005     # minimum global variance to consider ROI valid
 # ----------------------
 ESP32_ENABLED_DEFAULT = False
 ESP32_PORT_DEFAULT = None       # serial port for ESP32, e.g., "/dev/ttyUSB0"
+
+# ESP32-CAM specific optimizations
+ESP32_SIMILARITY_THRESHOLD = 0.975  # Adjusted threshold for ESP32-CAM (0.991 should pass)
+ESP32_VARIANCE_THRESHOLD = 0.001   # Higher variance threshold for ESP32-CAM
+ESP32_USE_ENHANCED_PREPROCESSING = True  # Enable ESP32-specific image enhancement
 
 # ----------------------
 # Snapshot / saving

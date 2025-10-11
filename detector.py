@@ -122,6 +122,11 @@ class PalmDetector:
         if roi is None or roi.size == 0:
             raise ValueError("Empty ROI")
         gray = roi.copy() if roi.ndim == 2 else cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Optimize for JPEG inputs: apply denoising to reduce compression artifacts
+        if roi.ndim == 3:  # Only for color images (likely from JPEG)
+            gray = cv2.medianBlur(gray, 3)  # Remove JPEG compression noise
+        
         resized = self._resize_with_padding(gray, self.config.size)
         equalized = cv2.equalizeHist(resized)
         return equalized.astype(np.uint8)

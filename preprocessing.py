@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 def preprocess_roi_96(roi_bgr: np.ndarray) -> np.ndarray:
     """Convert BGR ROI to grayscale and resize to 96x96 (uint8).
+    Optimized for JPEG inputs from ESP32-CAM.
 
     Args:
         roi_bgr: BGR input image crop.
@@ -28,6 +29,11 @@ def preprocess_roi_96(roi_bgr: np.ndarray) -> np.ndarray:
 
     try:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY) if roi_bgr.ndim == 3 else roi_bgr
+        
+        # Optimize for JPEG inputs: apply denoising to reduce compression artifacts
+        if roi_bgr.ndim == 3:  # Only for color images (likely from JPEG)
+            gray = cv2.medianBlur(gray, 3)  # Remove JPEG compression noise
+        
         resized = cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA)
         return resized.astype(np.uint8)
     except Exception as exc:
