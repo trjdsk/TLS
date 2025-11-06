@@ -17,6 +17,7 @@ if 'QT_QPA_PLATFORM' not in os.environ:
     os.environ['QT_QPA_PLATFORM'] = 'xcb'
 
 import argparse
+import socket
 import logging
 from dataclasses import dataclass
 from typing import Optional, Union, Any, Dict, List
@@ -25,6 +26,7 @@ import time
 import math
 
 import cv2
+import requests
 import numpy as np
 
 from utils import config
@@ -60,6 +62,9 @@ class AppConfig:
     esp32_port: Optional[str] = config.ESP32_PORT_DEFAULT
     save_snaps: bool = config.SAVE_SNAPS_DEFAULT
     snaps_dir: Optional[str] = str(config.SNAPS_DIR)
+    # ESP32 watcher options
+    esp32_watch: bool = True
+    esp32_ip: Optional[str] = None
 
 
 def setup_logging(level: str = None) -> None:
@@ -71,6 +76,17 @@ def setup_logging(level: str = None) -> None:
         level=numeric_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    # Ensure file logging to tls.log
+    try:
+        logger = logging.getLogger()
+        has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if not has_file:
+            fh = logging.FileHandler("tls.log")
+            fh.setLevel(numeric_level)
+            fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+            logger.addHandler(fh)
+    except Exception:
+        pass
 
 
 def parse_args() -> AppConfig:
@@ -90,6 +106,13 @@ def parse_args() -> AppConfig:
     parser.add_argument("--esp32-port", type=str, default=config.ESP32_PORT_DEFAULT)
     parser.add_argument("--save-snaps", action="store_true", default=config.SAVE_SNAPS_DEFAULT)
     parser.add_argument("--snaps-dir", type=str, default=str(config.SNAPS_DIR))
+    # ESP32 watcher controls (default enabled; use --no-esp32-watch to disable if supported)
+    try:
+        bool_action = argparse.BooleanOptionalAction
+        parser.add_argument("--esp32-watch", action=bool_action, default=True, help="Run ESP32-CAM watcher (default: on)")
+    except Exception:
+        parser.add_argument("--esp32-watch", action="store_true", default=True, help="Run ESP32-CAM watcher (default: on)")
+    parser.add_argument("--esp32-ip", type=str, default="auto", help="ESP32-CAM IP or 'auto' to derive x.y.z.184")
     try:
         bool_action = argparse.BooleanOptionalAction
         parser.add_argument("--display", action=bool_action, default=config.DISPLAY_DEFAULT)
@@ -127,7 +150,50 @@ def parse_args() -> AppConfig:
         esp32_port=args.esp32_port,
         save_snaps=getattr(args, "save_snaps", config.SAVE_SNAPS_DEFAULT),
         snaps_dir=getattr(args, "snaps_dir", str(config.SNAPS_DIR)),
+        esp32_watch=getattr(args, "esp32_watch", False),
+        esp32_ip=getattr(args, "esp32_ip", None) if getattr(args, "esp32_ip", None) != "auto" else None,
     )
+
+
+def _derive_device_ip_last_octet_184() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        # Fallback to common private range if detection fails
+        local_ip = "192.168.0.1"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    parts = local_ip.split(".")
+    if len(parts) == 4:
+        parts[-1] = "184"
+        return ".".join(parts)
+    return "192.168.0.184"
+
+
+_ESP_SESSION = requests.Session()
+_ESP_TIMEOUT = (1.5, 2.5)
+
+
+def esp_get(ip: str, path: str) -> tuple[int, Optional[Dict[str, Any]], Dict[str, Any]]:
+    url = f"http://{ip}:81{path}"
+    meta: Dict[str, Any] = {"url": url}
+    try:
+        resp = _ESP_SESSION.get(url, timeout=_ESP_TIMEOUT)
+        meta["headers"] = dict(resp.headers)
+        meta["ok"] = resp.ok
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        return resp.status_code, data, meta
+    except requests.RequestException as exc:
+        meta["error"] = str(exc)
+        return 0, None, meta
 
 
 def print_status(message: str) -> None:
@@ -186,6 +252,28 @@ def main() -> None:
     logger = logging.getLogger("app")
     logger.info("Starting Touchless Lock System | source=%s", str(app_cfg.source))
 
+    # Resolve ESP32 IP if requested
+    device_ip = app_cfg.esp32_ip or _derive_device_ip_last_octet_184()
+
+    # Optional ESP32-CAM watcher mode (run in background so main window can also run)
+    if getattr(app_cfg, "esp32_watch", False):
+        try:
+            import threading, asyncio  # local import to avoid forcing in non-watcher mode
+            from tls_stream_handler import StreamWatcher
+
+            def _run_watcher() -> None:
+                try:
+                    asyncio.run(StreamWatcher(device_ip).monitor())
+                except Exception:
+                    logging.getLogger("app").exception("Watcher thread crashed")
+
+        
+            t = threading.Thread(target=_run_watcher, daemon=True)
+            t.start()
+            logger.info("ESP32-CAM watcher started in background | ip=%s", device_ip)
+        except Exception as exc:
+            logger.error("Failed to start watcher: %s", exc, exc_info=True)
+
     # Setup cv2 threading/optimizations
     try:
         cv2.setUseOptimized(True)
@@ -199,6 +287,10 @@ def main() -> None:
     cap = None
     registrar = None
     try:
+        # Always use ESP32 webstream as source for camera pipeline
+        stream_url = f"http://{device_ip}:81/stream"
+        app_cfg.source = stream_url
+
         detector_cfg = DetectorConfig(
             min_detection_confidence=app_cfg.detection_confidence,
             min_tracking_confidence=app_cfg.tracking_confidence,
@@ -304,6 +396,13 @@ def main() -> None:
                                 logger.error("Registration error: %s", exc, exc_info=True)
                                 status_text = "Registration failed"
                                 print_status("Registration failed")
+                            # Always close IR gate after registration completes
+                            try:
+                                code_reset, data_reset, meta_reset = esp_get(device_ip, "/reset")
+                                logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_reset, data_reset, meta_reset)
+                            except Exception:
+                                logger.debug("ESP32 /reset call failed after registration", exc_info=True)
+
                             registering = False
                             registration_detections.clear()
                             registration_handedness = None
@@ -344,11 +443,26 @@ def main() -> None:
                                     display_name = matched_name if matched_name and matched_name != "Unknown" else f"User {matched_user_id}"
                                     status_text = f"Access Granted: {display_name}"
                                     print_status(f"Access Granted: {display_name}")
-                                    send_esp32_signal(True, app_cfg, logger)
+                                    # Successful verification: unlock then reset
+                                    try:
+                                        code_u, data_u, meta_u = esp_get(device_ip, "/unlock")
+                                        logger.info("ESP32 /unlock | status=%s | data=%s | meta=%s", code_u, data_u, meta_u)
+                                    except Exception:
+                                        logger.debug("ESP32 /unlock call failed", exc_info=True)
+                                    try:
+                                        code_r, data_r, meta_r = esp_get(device_ip, "/reset")
+                                        logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_r, data_r, meta_r)
+                                    except Exception:
+                                        logger.debug("ESP32 /reset call failed", exc_info=True)
                                 else:
                                     status_text = "Access Denied"
                                     print_status("Access Denied")
-                                    send_esp32_signal(False, app_cfg, logger)
+                                    # Failed verification: reset IR gate
+                                    try:
+                                        code_r, data_r, meta_r = esp_get(device_ip, "/reset")
+                                        logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_r, data_r, meta_r)
+                                    except Exception:
+                                        logger.debug("ESP32 /reset call failed", exc_info=True)
                             except Exception as exc:
                                 logger.error("Verification error: %s", exc, exc_info=True)
                                 status_text = "Verification failed"

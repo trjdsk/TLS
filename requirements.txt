@@ -4,3 +4,5 @@ mediapipe==0.10.14
 scikit-image>=0.19.0
 # MediaPipe-only detection pipeline
 # Uses MediaPipe Hands for palm detection and LBP features for biometric verification
+aiohttp>=3.9
+requests>=2.31
