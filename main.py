@@ -180,7 +180,7 @@ _ESP_TIMEOUT = (1.5, 2.5)
 
 
 def esp_get(ip: str, path: str) -> tuple[int, Optional[Dict[str, Any]], Dict[str, Any]]:
-    url = f"http://{ip}:81{path}"
+    url = f"http://{ip}:80{path}"
     meta: Dict[str, Any] = {"url": url}
     try:
         resp = _ESP_SESSION.get(url, timeout=_ESP_TIMEOUT)
@@ -286,45 +286,8 @@ def main() -> None:
     detector = None
     cap = None
     registrar = None
-    try:
-        # Always use ESP32 webstream as source for camera pipeline
-        stream_url = f"http://{device_ip}:81/stream"
-        app_cfg.source = stream_url
 
-        detector_cfg = DetectorConfig(
-            min_detection_confidence=app_cfg.detection_confidence,
-            min_tracking_confidence=app_cfg.tracking_confidence,
-        )
-        detector = PalmDetector(config=detector_cfg, max_num_hands=config.MAX_NUM_HANDS)
-
-        registrar_config = RegistrarConfig(use_geometry=app_cfg.use_geometry)
-        registrar = PalmRegistrar(config=registrar_config)
-
-        cap = VideoCapture(
-            source=app_cfg.source,
-            width=app_cfg.width,
-            height=app_cfg.height,
-            buffer_size=app_cfg.camera_buffer_size,
-            detector=detector,
-            save_snaps=app_cfg.save_snaps,
-            snaps_dir=app_cfg.snaps_dir,
-        )
-        cap.open()
-    except Exception as exc:
-        logger.error("Could not initialize detector/camera/registrar: %s", exc, exc_info=True)
-        # ensure partial resources are closed
-        try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            pass
-        try:
-            if detector is not None:
-                detector.close()
-        except Exception:
-            pass
-        return
-
+    # Prepare window immediately so UI shows while waiting for stream
     window_name = config.WINDOW_NAME
     if app_cfg.display:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -332,6 +295,47 @@ def main() -> None:
             cv2.resizeWindow(window_name, *config.WINDOW_DEFAULT_RESOLUTION)
         except Exception:
             pass
+
+    def show_placeholder(message: str, wait_ms: int = 100) -> int:
+        """Render a placeholder frame with status + stream IP."""
+        if not app_cfg.display:
+            return 0
+        try:
+            w, h = config.WINDOW_DEFAULT_RESOLUTION
+            placeholder = np.zeros((h, w, 3), dtype=np.uint8)
+            cv2.putText(placeholder, message, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            ip_label = f"Stream: {device_ip}"
+            cv2.putText(placeholder, ip_label, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
+            cv2.imshow(window_name, placeholder)
+            return cv2.waitKey(wait_ms) & 0xFF
+        except Exception:
+            return 0
+
+    # Always use ESP32 webstream as source for camera pipeline
+    stream_url = f"http://{device_ip}:81/stream"
+    app_cfg.source = stream_url
+
+    # Initialize detector/registrar in a background thread so GUI stays responsive
+    import threading
+    init_state = {"done": False, "error": None, "detector": None, "registrar": None}
+
+    def _init_models() -> None:
+        try:
+            det_cfg = DetectorConfig(
+                min_detection_confidence=app_cfg.detection_confidence,
+                min_tracking_confidence=app_cfg.tracking_confidence,
+            )
+            det = PalmDetector(config=det_cfg, max_num_hands=config.MAX_NUM_HANDS)
+            reg_cfg = RegistrarConfig(use_geometry=app_cfg.use_geometry)
+            reg = PalmRegistrar(config=reg_cfg)
+            init_state["detector"] = det
+            init_state["registrar"] = reg
+        except Exception as e:
+            init_state["error"] = e
+        finally:
+            init_state["done"] = True
+
+    threading.Thread(target=_init_models, daemon=True).start()
 
     status_text = "Touchless Lock System Ready. Press 'r' to Register, 'q' to quit."
 
@@ -343,6 +347,9 @@ def main() -> None:
     verification_detections: List[PalmDetection] = []
     verification_targets: int = config.VERIFICATION_TARGETS
     verification_cooldown: Optional[float] = None
+    # Delay before starting verification after a valid palm is detected
+    recognition_delay_start: Optional[float] = None
+    recognition_delay_seconds: float = 3.0
 
     frame_index: int = 0
 
@@ -352,17 +359,71 @@ def main() -> None:
             frame_index += 1
 
             now = time.time()
+            # If models not ready yet, keep GUI responsive and show init message
+            if detector is None or registrar is None:
+                if init_state["done"] and init_state["error"] is not None:
+                    # Initialization failed
+                    key = show_placeholder("Initialization failed. Press q to quit.", wait_ms=200)
+                    if key == ord("q"):
+                        logger.error("Initialization failed: %s", init_state["error"], exc_info=True)
+                        break
+                    continue
+                elif init_state["done"]:
+                    detector = init_state["detector"]
+                    registrar = init_state["registrar"]
+                    logger.info("Recognition initialized.")
+                else:
+                    key = show_placeholder("Initializing recognition...", wait_ms=50)
+                    if key == ord("q"):
+                        logger.info("Quit requested by user during initialization.")
+                        break
+                    continue
+
+            # Ensure capture is opened; if not, show waiting screen and retry open
+            if cap is None:
+                # Attempt to open the stream while keeping window responsive
+                try:
+                    cap = VideoCapture(
+                        source=app_cfg.source,
+                        width=app_cfg.width,
+                        height=app_cfg.height,
+                        buffer_size=app_cfg.camera_buffer_size,
+                        detector=detector,
+                        save_snaps=app_cfg.save_snaps,
+                        snaps_dir=app_cfg.snaps_dir,
+                    )
+                    cap.open()
+                    logger.info("Stream opened: %s", app_cfg.source)
+                except Exception:
+                    cap = None
+                    key = show_placeholder("Waiting for stream...", wait_ms=200)
+
+                    if key == ord("q"):
+                        logger.info("Quit requested by user while waiting for stream.")
+                        break
+                    elif key == ord("r"):
+                        # ignore registration while waiting for stream
+                        pass
+                    continue
+
             # Fetch frame and detections
             success, annotated, palm_detections = False, None, None
             try:
                 success, annotated, palm_detections = cap.get_palm_frame()
             except Exception as exc:
                 logger.error("Error fetching frame: %s", exc, exc_info=True)
-                break
+                success, annotated, palm_detections = False, None, None
 
             if not success or annotated is None:
-                logger.warning("No frame received from source.")
-                break
+                logger.warning("No frame received from source. Will retry opening stream.")
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                cap = None
+                # brief pause while showing waiting screen handled next loop
+                continue
 
             # If in cooldown, skip verification processing but still display/capture frames
             if verification_cooldown is not None and now < verification_cooldown:
@@ -406,6 +467,8 @@ def main() -> None:
                             registering = False
                             registration_detections.clear()
                             registration_handedness = None
+                            # Enter 10s cooldown after registration completes
+                            verification_cooldown = now + 10.0
                     else:
                         status_text = "Show your palm for registration..."
                 else:
@@ -427,9 +490,18 @@ def main() -> None:
 
                         if not palm_facing:
                             status_text = f"{handedness} palm detected but not facing camera"
+                            recognition_delay_start = None
                         else:
-                            verification_detections.append(palm_detect)
-                            status_text = f"Verification: {len(verification_detections)}/{verification_targets} detections"
+                            # Start or continue the 3s delay before recognition
+                            if recognition_delay_start is None:
+                                recognition_delay_start = now
+                            elapsed = now - (recognition_delay_start or now)
+                            if elapsed < recognition_delay_seconds:
+                                remaining = max(0.0, recognition_delay_seconds - elapsed)
+                                status_text = f"Hold steady... starting in {remaining:.1f}s"
+                            else:
+                                verification_detections.append(palm_detect)
+                                status_text = f"Verification: {len(verification_detections)}/{verification_targets} detections"
 
                         if len(verification_detections) >= verification_targets:
                             try:
@@ -468,15 +540,21 @@ def main() -> None:
                                 status_text = "Verification failed"
                                 print_status("Verification failed")
                             verification_detections.clear()
-                            verification_cooldown = now + config.VERIFICATION_COOLDOWN_SECONDS
+                            recognition_delay_start = None
+                            # Enter 10s cooldown after verification completes
+                            verification_cooldown = now + 10.0
                     else:
                         status_text = "No valid palm detected. Press 'r' to Register, 'q' to quit."
+                        recognition_delay_start = None
 
             # Display
             if app_cfg.display and annotated is not None:
                 try:
                     cv2.putText(annotated, status_text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (255, 255, 255), 2)
+                    ip_label = f"Stream: {device_ip}"
+                    cv2.putText(annotated, ip_label, (8, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (180, 255, 180), 1)
                 except Exception:
                     logger.debug("Failed to draw status text", exc_info=True)
                 cv2.imshow(window_name, annotated)
