@@ -196,6 +196,85 @@ def esp_get(ip: str, path: str) -> tuple[int, Optional[Dict[str, Any]], Dict[str
         return 0, None, meta
 
 
+def esp_heartbeat(ip: str, logger: logging.Logger) -> bool:
+    """Send heartbeat to extend gate timeout by 15 seconds.
+    
+    Returns:
+        True if heartbeat successful (gate open), False if gate closed or error
+    """
+    try:
+        code, data, meta = esp_get(ip, "/heartbeat")
+        if code == 200 and data and data.get("heartbeat") is True:
+            logger.debug("Heartbeat sent successfully | gateOpen=%s", data.get("gateOpen"))
+            return True
+        elif code == 403:
+            logger.debug("Heartbeat: gate closed")
+            return False
+        else:
+            logger.debug("Heartbeat: unexpected response | code=%s | data=%s", code, data)
+            return False
+    except Exception as exc:
+        logger.debug("Heartbeat failed: %s", exc)
+        return False
+
+
+def esp_status(ip: str, logger: logging.Logger) -> Optional[Dict[str, Any]]:
+    """Get ESP32 status including stream availability.
+    
+    Returns:
+        Status dict with keys like 'streaming', 'irGate', 'awaitingVerification', 'cooldown', etc.
+        None if request failed
+    """
+    try:
+        code, data, meta = esp_get(ip, "/status")
+        if code == 200 and data:
+            logger.debug("Status check successful | streaming=%s | irGate=%s | awaitingVerification=%s | cooldown=%s",
+                        data.get("streaming"), data.get("irGate"), data.get("awaitingVerification"), data.get("cooldown"))
+            return data
+        else:
+            logger.debug("Status check failed | code=%s | data=%s", code, data)
+            return None
+    except Exception as exc:
+        logger.debug("Status check exception: %s", exc)
+        return None
+
+
+def esp_verify(ip: str, result: bool, logger: logging.Logger) -> bool:
+    """Send verification result, unlock servo (if successful), and close gate.
+    
+    When result=true:
+        - Automatically unlocks the servo
+        - Closes the gate
+        - Response includes unlocked: true
+    
+    When result=false:
+        - Does not unlock servo
+        - Closes the gate
+        - Response includes unlocked: false
+    
+    Args:
+        ip: ESP32 IP address
+        result: True for successful verification (unlocks servo), False for failed
+        logger: Logger instance
+        
+    Returns:
+        True if request successful, False otherwise
+    """
+    try:
+        result_str = "true" if result else "false"
+        code, data, meta = esp_get(ip, f"/verify?result={result_str}")
+        if code == 200:
+            unlocked = data.get("unlocked", False) if data else False
+            logger.info("ESP32 /verify | result=%s | unlocked=%s | data=%s", result_str, unlocked, data)
+            return True
+        else:
+            logger.warning("ESP32 /verify failed | code=%s | data=%s", code, data)
+            return False
+    except Exception as exc:
+        logger.error("ESP32 /verify exception: %s", exc)
+        return False
+
+
 def print_status(message: str) -> None:
     try:
         sys.stdout.write(f"\r{message}")
@@ -255,6 +334,9 @@ def main() -> None:
     # Resolve ESP32 IP if requested
     device_ip = app_cfg.esp32_ip or _derive_device_ip_last_octet_184()
 
+    # Shared flag to tell watcher when main stream is active
+    main_stream_active = {"value": False}
+    
     # Optional ESP32-CAM watcher mode (run in background so main window can also run)
     if getattr(app_cfg, "esp32_watch", False):
         try:
@@ -263,7 +345,9 @@ def main() -> None:
 
             def _run_watcher() -> None:
                 try:
-                    asyncio.run(StreamWatcher(device_ip).monitor())
+                    watcher = StreamWatcher(device_ip)
+                    watcher.main_stream_active = main_stream_active
+                    asyncio.run(watcher.monitor())
                 except Exception:
                     logging.getLogger("app").exception("Watcher thread crashed")
 
@@ -289,12 +373,97 @@ def main() -> None:
 
     # Prepare window immediately so UI shows while waiting for stream
     window_name = config.WINDOW_NAME
+    control_panel_name = "Camera Controls"
+    
+    # Camera settings state
+    camera_settings = {
+        "rotation": 0,  # 0, 90, 180, 270 degrees
+        "brightness": 0,  # -100 to 100
+        "contrast": 0,  # -100 to 100
+        "saturation": 0,  # -100 to 100
+        "hue": 0,  # -180 to 180
+        "flip_horizontal": 0,  # 0 or 1
+        "flip_vertical": 0,  # 0 or 1
+    }
+    
+    def apply_camera_settings(frame: np.ndarray) -> np.ndarray:
+        """Apply camera settings transformations to frame."""
+        if frame is None:
+            return frame
+        result = frame.copy()
+        
+        # Rotation
+        if camera_settings["rotation"] == 90:
+            result = cv2.rotate(result, cv2.ROTATE_90_CLOCKWISE)
+        elif camera_settings["rotation"] == 180:
+            result = cv2.rotate(result, cv2.ROTATE_180)
+        elif camera_settings["rotation"] == 270:
+            result = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        
+        # Flip
+        if camera_settings["flip_horizontal"]:
+            result = cv2.flip(result, 1)
+        if camera_settings["flip_vertical"]:
+            result = cv2.flip(result, 0)
+        
+        # Color adjustments (convert to HSV for hue/saturation, then back)
+        if camera_settings["brightness"] != 0 or camera_settings["contrast"] != 0:
+            alpha = 1.0 + (camera_settings["contrast"] / 100.0)
+            beta = camera_settings["brightness"]
+            result = cv2.convertScaleAbs(result, alpha=alpha, beta=beta)
+        
+        if camera_settings["saturation"] != 0 or camera_settings["hue"] != 0:
+            hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
+            # Adjust saturation
+            if camera_settings["saturation"] != 0:
+                hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + camera_settings["saturation"] / 100.0), 0, 255)
+            # Adjust hue
+            if camera_settings["hue"] != 0:
+                hsv[:, :, 0] = (hsv[:, :, 0] + camera_settings["hue"]) % 180
+            result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        
+        return result
+    
+    def on_rotation_change(val: int) -> None:
+        camera_settings["rotation"] = val * 90
+    
+    def on_brightness_change(val: int) -> None:
+        camera_settings["brightness"] = val - 100
+    
+    def on_contrast_change(val: int) -> None:
+        camera_settings["contrast"] = val - 100
+    
+    def on_saturation_change(val: int) -> None:
+        camera_settings["saturation"] = val - 100
+    
+    def on_hue_change(val: int) -> None:
+        camera_settings["hue"] = val - 180
+    
+    def on_flip_h_change(val: int) -> None:
+        camera_settings["flip_horizontal"] = val
+    
+    def on_flip_v_change(val: int) -> None:
+        camera_settings["flip_vertical"] = val
+    
     if app_cfg.display:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         try:
             cv2.resizeWindow(window_name, *config.WINDOW_DEFAULT_RESOLUTION)
         except Exception:
             pass
+        
+        # Create control panel window
+        cv2.namedWindow(control_panel_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(control_panel_name, 300, 500)
+        
+        # Create trackbars
+        cv2.createTrackbar("Rotation (0/90/180/270)", control_panel_name, 0, 3, on_rotation_change)
+        cv2.createTrackbar("Brightness", control_panel_name, 100, 200, on_brightness_change)
+        cv2.createTrackbar("Contrast", control_panel_name, 100, 200, on_contrast_change)
+        cv2.createTrackbar("Saturation", control_panel_name, 100, 200, on_saturation_change)
+        cv2.createTrackbar("Hue", control_panel_name, 180, 360, on_hue_change)
+        cv2.createTrackbar("Flip H", control_panel_name, 0, 1, on_flip_h_change)
+        cv2.createTrackbar("Flip V", control_panel_name, 0, 1, on_flip_v_change)
 
     def show_placeholder(message: str, wait_ms: int = 100) -> int:
         """Render a placeholder frame with status + stream IP."""
@@ -336,6 +505,35 @@ def main() -> None:
             init_state["done"] = True
 
     threading.Thread(target=_init_models, daemon=True).start()
+    
+    def _heartbeat_loop() -> None:
+        """Background thread that sends heartbeats every 8-10 seconds."""
+        while not heartbeat_stop_event.is_set():
+            try:
+                esp_heartbeat(device_ip, logger)
+            except Exception as exc:
+                logger.debug("Heartbeat loop error: %s", exc)
+            
+            # Wait for interval or stop event
+            if heartbeat_stop_event.wait(timeout=heartbeat_interval):
+                break  # Stop event was set
+    
+    def start_heartbeat() -> None:
+        """Start heartbeat thread if not already running."""
+        nonlocal heartbeat_thread
+        if heartbeat_thread is None or not heartbeat_thread.is_alive():
+            heartbeat_stop_event.clear()
+            heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
+            logger.info("Heartbeat started (interval: %.1fs)", heartbeat_interval)
+    
+    def stop_heartbeat() -> None:
+        """Stop heartbeat thread."""
+        nonlocal heartbeat_thread
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
+            heartbeat_stop_event.set()
+            heartbeat_thread.join(timeout=1.0)
+            logger.info("Heartbeat stopped")
 
     status_text = "Touchless Lock System Ready. Press 'r' to Register, 'q' to quit."
 
@@ -343,6 +541,9 @@ def main() -> None:
     registration_detections: List[PalmDetection] = []
     registration_targets: int = config.REGISTRATION_TARGETS
     registration_handedness: Optional[str] = None
+    # Delay before starting registration after a valid palm is detected
+    registration_delay_start: Optional[float] = None
+    registration_delay_seconds: float = 3.0
 
     verification_detections: List[PalmDetection] = []
     verification_targets: int = config.VERIFICATION_TARGETS
@@ -350,6 +551,15 @@ def main() -> None:
     # Delay before starting verification after a valid palm is detected
     recognition_delay_start: Optional[float] = None
     recognition_delay_seconds: float = 3.0
+    
+    # Heartbeat management
+    heartbeat_thread: Optional[threading.Thread] = None
+    heartbeat_stop_event = threading.Event()
+    heartbeat_interval: float = 5.0  # Send heartbeat every 5 seconds
+    
+    # Stream reconnection cooldown (respect ESP32 cooldown period)
+    stream_close_time: Optional[float] = None
+    stream_reconnect_cooldown: float = 2.5  # Wait 2.5s after stream closes before reconnecting (ESP32 cooldown is 2s)
 
     frame_index: int = 0
 
@@ -379,9 +589,74 @@ def main() -> None:
                         break
                     continue
 
-            # Ensure capture is opened; if not, show waiting screen and retry open
+            # Ensure capture is opened; if not, check status and open stream
             if cap is None:
-                # Attempt to open the stream while keeping window responsive
+                # Check if we're in cooldown period after stream closed
+                if stream_close_time is not None:
+                    elapsed = now - stream_close_time
+                    if elapsed < stream_reconnect_cooldown:
+                        remaining = stream_reconnect_cooldown - elapsed
+                        # Show waiting screen during cooldown
+                        if app_cfg.display:
+                            key = show_placeholder(f"Waiting for cooldown... {remaining:.1f}s", wait_ms=100)
+                            if key == ord("q"):
+                                logger.info("Quit requested during cooldown.")
+                                break
+                        else:
+                            time.sleep(0.1)
+                        continue
+                    else:
+                        # Cooldown finished, clear the timestamp
+                        stream_close_time = None
+                
+                # Check status endpoint to see if stream is available
+                status = esp_status(device_ip, logger)
+                if status is None:
+                    # Status check failed, show waiting screen
+                    if app_cfg.display:
+                        key = show_placeholder("Checking status...", wait_ms=200)
+                        if key == ord("q"):
+                            logger.info("Quit requested while checking status.")
+                            break
+                    else:
+                        time.sleep(0.2)
+                    continue
+                
+                # Check if stream is available according to status
+                ir_gate = status.get("irGate", False)
+                cooldown = status.get("cooldown", False)
+                cooldown_ms = status.get("cooldownMs", 0)
+                
+                # If in cooldown, wait for it to finish
+                if cooldown and cooldown_ms > 0:
+                    main_stream_active["value"] = False
+                    if app_cfg.display:
+                        key = show_placeholder(f"ESP32 cooldown: {cooldown_ms/1000:.1f}s", wait_ms=200)
+                        if key == ord("q"):
+                            logger.info("Quit requested during ESP32 cooldown.")
+                            break
+                    else:
+                        time.sleep(0.2)
+                    continue
+                
+                # Start stream when irGate is true
+                if not ir_gate:
+                    # Gate not open yet
+                    main_stream_active["value"] = False
+                    if app_cfg.display:
+                        key = show_placeholder("Waiting for gate to open...", wait_ms=200)
+                        if key == ord("q"):
+                            logger.info("Quit requested while waiting for gate.")
+                            break
+                    else:
+                        time.sleep(0.2)
+                    continue
+                
+                # Stream is ready according to status - now open it
+                # Mark stream as inactive until confirmed open
+                main_stream_active["value"] = False
+                
+                # Attempt to open the stream while keeping window responsive (non-blocking)
                 try:
                     cap = VideoCapture(
                         source=app_cfg.source,
@@ -392,11 +667,40 @@ def main() -> None:
                         save_snaps=app_cfg.save_snaps,
                         snaps_dir=app_cfg.snaps_dir,
                     )
-                    cap.open()
-                    logger.info("Stream opened: %s", app_cfg.source)
-                except Exception:
+                    # Open with timeout - non-blocking
+                    if cap.open(timeout=1.5):
+                        logger.info("Stream opened: %s", app_cfg.source)
+                        main_stream_active["value"] = True  # Mark stream as active
+                        # Send immediate heartbeat to extend gate timeout
+                        try:
+                            esp_heartbeat(device_ip, logger)
+                            logger.info("Heartbeat sent after stream opened")
+                        except Exception:
+                            logger.debug("Failed to send heartbeat after stream opened", exc_info=True)
+                        # Start continuous heartbeat to keep gate open while stream is active
+                        start_heartbeat()
+                        logger.info("Heartbeat thread started to keep gate open")
+                    else:
+                        # Connection failed or timed out - release and retry
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        main_stream_active["value"] = False
+                except Exception as exc:
+                    logger.debug("Exception during stream open: %s", exc)
+                    try:
+                        if cap is not None:
+                            cap.release()
+                    except Exception:
+                        pass
                     cap = None
-                    key = show_placeholder("Waiting for stream...", wait_ms=200)
+                    main_stream_active["value"] = False
+                
+                # If still not opened, show waiting screen and keep window responsive
+                if cap is None:
+                    key = show_placeholder("Failed to open stream. Retrying...", wait_ms=200)
 
                     if key == ord("q"):
                         logger.info("Quit requested by user while waiting for stream.")
@@ -406,24 +710,112 @@ def main() -> None:
                         pass
                     continue
 
-            # Fetch frame and detections
+            # Fetch frame and detections (non-blocking now)
             success, annotated, palm_detections = False, None, None
+            stream_error = False
             try:
-                success, annotated, palm_detections = cap.get_palm_frame()
+                # Check if stream is still valid before reading
+                if cap._cap is not None:
+                    if not cap._cap.isOpened():
+                        stream_error = True
+                    else:
+                        # This is now non-blocking - it just gets the latest frame from background thread
+                        success, annotated, palm_detections = cap.get_palm_frame()
+                        # If no frame available, mark as error but don't block
+                        if not success:
+                            stream_error = True
+                else:
+                    stream_error = True
+            except cv2.error as exc:
+                logger.warning("OpenCV error (stream may be disconnected): %s", exc)
+                stream_error = True
             except Exception as exc:
                 logger.error("Error fetching frame: %s", exc, exc_info=True)
-                success, annotated, palm_detections = False, None, None
+                stream_error = True
 
-            if not success or annotated is None:
-                logger.warning("No frame received from source. Will retry opening stream.")
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
-                cap = None
-                # brief pause while showing waiting screen handled next loop
+            if stream_error or not success or annotated is None:
+                # Stream not available - check status to see what happened
+                logger.debug("No frame available - checking status...")
+                
+                # Check status endpoint to understand what happened
+                status = esp_status(device_ip, logger)
+                
+                # Mark stream as inactive
+                main_stream_active["value"] = False
+                
+                # Stop heartbeat when stream disconnects
+                stop_heartbeat()
+                
+                # Reset all active processes when stream disconnects
+                if registering:
+                    registering = False
+                    registration_detections.clear()
+                    registration_handedness = None
+                    registration_delay_start = None
+                    status_text = "Stream disconnected. Registration cancelled."
+                
+                # Reset verification state
+                verification_detections.clear()
+                recognition_delay_start = None
+                verification_cooldown = None
+                
+                # Check status to see if stream should be closed
+                should_close = False
+                if status is not None:
+                    ir_gate = status.get("irGate", False)
+                    cooldown = status.get("cooldown", False)
+                    
+                    if not ir_gate:
+                        # Gate is closed, stream should be closed
+                        should_close = True
+                        if cooldown:
+                            logger.info("ESP32 gate closed (cooldown) - closing stream")
+                        else:
+                            logger.warning("ESP32 gate closed - closing stream")
+                    else:
+                        # Gate is still open, but we can't read frames
+                        # This might be a connection issue
+                        logger.warning("Gate is open but frames not readable - closing stream")
+                        should_close = True
+                else:
+                    # Status check failed, assume stream should be closed
+                    should_close = True
+                
+                if should_close:
+                    try:
+                        # Check if stream is completely dead
+                        if cap is not None and cap._cap is not None and not cap._cap.isOpened():
+                            logger.warning("Stream connection lost. Entering cooldown before reconnecting...")
+                        else:
+                            logger.warning("Stream disconnected. Entering cooldown before reconnecting...")
+                        
+                        # Record when stream closed for cooldown period
+                        stream_close_time = now
+                        try:
+                            if cap is not None:
+                                cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                    except Exception:
+                        pass
+                
+                # Show waiting screen (clears the window) and keep window responsive
+                if app_cfg.display:
+                    key = show_placeholder("Stream disconnected. Waiting for stream...", wait_ms=50)
+                    if key == ord("q"):
+                        logger.info("Quit requested by user while waiting for stream.")
+                        break
+                else:
+                    # If no display, just sleep briefly to avoid busy-waiting
+                    time.sleep(0.1)
                 continue
+            
+            # Apply camera settings transformations
+            try:
+                annotated = apply_camera_settings(annotated)
+            except Exception as exc:
+                logger.debug("Failed to apply camera settings: %s", exc)
 
             # If in cooldown, skip verification processing but still display/capture frames
             if verification_cooldown is not None and now < verification_cooldown:
@@ -437,8 +829,41 @@ def main() -> None:
                 if registering:
                     if palm_detections:
                         palm_detect = palm_detections[0]
-                        registration_detections.append(palm_detect)
-                        status_text = f"Registration: {len(registration_detections)}/{registration_targets} detections"
+                        landmarks = getattr(palm_detect, "landmarks", None)
+                        handedness = getattr(palm_detect, "handedness", "Right")
+                        palm_facing = False
+
+                        if landmarks:
+                            if callable(is_palm_facing_camera):
+                                try:
+                                    palm_facing = is_palm_facing_camera(landmarks)
+                                except Exception:
+                                    palm_facing = _fallback_is_palm_facing_camera(landmarks, handedness)
+                            else:
+                                palm_facing = _fallback_is_palm_facing_camera(landmarks, handedness)
+
+                        if not palm_facing:
+                            status_text = f"{handedness} palm detected but not facing camera"
+                            registration_delay_start = None
+                            # Stop heartbeat if palm not facing
+                            if len(registration_detections) == 0:
+                                stop_heartbeat()
+                        else:
+                            # Start heartbeat immediately when valid palm is detected (before delay)
+                            if registration_delay_start is None:
+                                registration_delay_start = now
+                                start_heartbeat()  # Start heartbeat as soon as valid palm detected
+                            
+                            # Start or continue the 3s delay before registration
+                            elapsed = now - (registration_delay_start or now)
+                            if elapsed < registration_delay_seconds:
+                                remaining = max(0.0, registration_delay_seconds - elapsed)
+                                status_text = f"Hold steady... starting in {remaining:.1f}s"
+                            else:
+                                # Delay passed, start collecting detections
+                                registration_detections.append(palm_detect)
+                                status_text = f"Registration: {len(registration_detections)}/{registration_targets} detections"
+                        
                         if len(registration_detections) >= registration_targets:
                             try:
                                 user_name = input("\nRegistration complete! Enter your name: ").strip() or "Unknown"
@@ -457,20 +882,24 @@ def main() -> None:
                                 logger.error("Registration error: %s", exc, exc_info=True)
                                 status_text = "Registration failed"
                                 print_status("Registration failed")
-                            # Always close IR gate after registration completes
+                            
+                            # Send verification result (heartbeat continues until stream closes)
                             try:
-                                code_reset, data_reset, meta_reset = esp_get(device_ip, "/reset")
-                                logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_reset, data_reset, meta_reset)
+                                esp_verify(device_ip, success_reg, logger)
+                                # Gate will close, set cooldown timestamp
+                                stream_close_time = now
                             except Exception:
-                                logger.debug("ESP32 /reset call failed after registration", exc_info=True)
+                                logger.debug("ESP32 /verify call failed after registration", exc_info=True)
 
                             registering = False
                             registration_detections.clear()
                             registration_handedness = None
+                            registration_delay_start = None
                             # Enter 10s cooldown after registration completes
                             verification_cooldown = now + 10.0
                     else:
                         status_text = "Show your palm for registration..."
+                        registration_delay_start = None
                 else:
                     # Normal verification flow
                     if palm_detections:
@@ -491,15 +920,22 @@ def main() -> None:
                         if not palm_facing:
                             status_text = f"{handedness} palm detected but not facing camera"
                             recognition_delay_start = None
+                            # Stop heartbeat if palm not facing
+                            if len(verification_detections) == 0:
+                                stop_heartbeat()
                         else:
-                            # Start or continue the 3s delay before recognition
+                            # Start heartbeat immediately when valid palm is detected (before delay)
                             if recognition_delay_start is None:
                                 recognition_delay_start = now
+                                start_heartbeat()  # Start heartbeat as soon as valid palm detected
+                            
+                            # Start or continue the 3s delay before recognition
                             elapsed = now - (recognition_delay_start or now)
                             if elapsed < recognition_delay_seconds:
                                 remaining = max(0.0, recognition_delay_seconds - elapsed)
                                 status_text = f"Hold steady... starting in {remaining:.1f}s"
                             else:
+                                # Delay passed, start collecting detections
                                 verification_detections.append(palm_detect)
                                 status_text = f"Verification: {len(verification_detections)}/{verification_targets} detections"
 
@@ -511,30 +947,28 @@ def main() -> None:
                                     use_geometry=app_cfg.use_geometry,
                                     similarity_threshold=app_cfg.similarity_threshold
                                 )
+                                # Send verification result (heartbeat continues until stream closes)
                                 if is_match:
                                     display_name = matched_name if matched_name and matched_name != "Unknown" else f"User {matched_user_id}"
                                     status_text = f"Access Granted: {display_name}"
                                     print_status(f"Access Granted: {display_name}")
-                                    # Successful verification: unlock then reset
+                                    # Successful verification: send verify=true
                                     try:
-                                        code_u, data_u, meta_u = esp_get(device_ip, "/unlock")
-                                        logger.info("ESP32 /unlock | status=%s | data=%s | meta=%s", code_u, data_u, meta_u)
+                                        esp_verify(device_ip, True, logger)
+                                        # Gate will close, set cooldown timestamp
+                                        stream_close_time = now
                                     except Exception:
-                                        logger.debug("ESP32 /unlock call failed", exc_info=True)
-                                    try:
-                                        code_r, data_r, meta_r = esp_get(device_ip, "/reset")
-                                        logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_r, data_r, meta_r)
-                                    except Exception:
-                                        logger.debug("ESP32 /reset call failed", exc_info=True)
+                                        logger.debug("ESP32 /verify call failed after successful verification", exc_info=True)
                                 else:
                                     status_text = "Access Denied"
                                     print_status("Access Denied")
-                                    # Failed verification: reset IR gate
+                                    # Failed verification: send verify=false
                                     try:
-                                        code_r, data_r, meta_r = esp_get(device_ip, "/reset")
-                                        logger.info("ESP32 /reset | status=%s | data=%s | meta=%s", code_r, data_r, meta_r)
+                                        esp_verify(device_ip, False, logger)
+                                        # Gate will close, set cooldown timestamp
+                                        stream_close_time = now
                                     except Exception:
-                                        logger.debug("ESP32 /reset call failed", exc_info=True)
+                                        logger.debug("ESP32 /verify call failed after failed verification", exc_info=True)
                             except Exception as exc:
                                 logger.error("Verification error: %s", exc, exc_info=True)
                                 status_text = "Verification failed"
@@ -546,6 +980,10 @@ def main() -> None:
                     else:
                         status_text = "No valid palm detected. Press 'r' to Register, 'q' to quit."
                         recognition_delay_start = None
+                        # Stop heartbeat if no palm detected (user moved away)
+                        if len(verification_detections) > 0:
+                            stop_heartbeat()
+                            verification_detections.clear()
 
             # Display
             if app_cfg.display and annotated is not None:
@@ -570,12 +1008,15 @@ def main() -> None:
                 registering = True
                 registration_detections.clear()
                 registration_handedness = None
+                registration_delay_start = None
                 status_text = "Registration started. Show your palm..."
                 print_status(status_text)
             elif key == ord("c") and registering:
                 registering = False
                 registration_detections.clear()
                 registration_handedness = None
+                registration_delay_start = None
+                stop_heartbeat()
                 status_text = "Registration cancelled."
                 print_status(status_text)
 
@@ -616,6 +1057,12 @@ def main() -> None:
                 cv2.destroyAllWindows()
         except Exception:
             logger.debug("Error destroying windows", exc_info=True)
+        
+        # Stop heartbeat on shutdown
+        try:
+            stop_heartbeat()
+        except Exception:
+            pass
 
         logger.info("Shutdown complete.")
 

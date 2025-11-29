@@ -15,6 +15,7 @@ class StreamWatcher:
         self.logger = logging.getLogger("stream_watcher")
         self._last_online: Optional[bool] = None
         self._stop = asyncio.Event()
+        self.main_stream_active: Optional[dict] = None  # Shared flag from main app
 
     async def __aenter__(self):
         return self
@@ -22,58 +23,72 @@ class StreamWatcher:
     async def __aexit__(self, exc_type, exc, tb):
         return None
 
-    async def check_stream_status(self) -> bool:
+    async def check_stream_status(self) -> Optional[dict]:
+        """Check ESP32 status endpoint instead of directly checking stream.
+        
+        Returns:
+            Status dict if successful, None if failed
+        """
         try:
-            # Synchronous request per specification
-            resp = requests.get(self.stream_url, timeout=(1.5, 2.5), stream=True)
-            status = int(getattr(resp, "status_code", 0) or 0)
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            self.logger.debug("Probe %s -> status=%s ctype=%s", self.stream_url, status, ctype)
-
-            # Explicit IR gate closed
-            if status == 403:
-                return False
-
-            # Some firmwares return HTML when gate is closed
-            if "text/html" in ctype:
-                return False
-
-            # Treat any 2xx as online (M-JPEG header may be missing)
-            if 200 <= status < 300:
-                return True
-
-            return False
+            status_url = f"http://{self.ip}:80/status"
+            resp = requests.get(status_url, timeout=(1.5, 2.5))
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    self.logger.debug("Status check successful | streaming=%s | irGate=%s | awaitingVerification=%s",
+                                    data.get("streaming"), data.get("irGate"), data.get("awaitingVerification"))
+                    return data
+                except Exception as exc:
+                    self.logger.debug("Failed to parse status JSON: %s", exc)
+                    return None
+            else:
+                self.logger.debug("Status check returned non-200 status: %s", resp.status_code)
+                return None
         except requests.RequestException as exc:
-            self.logger.debug("Stream check failed: %s", exc)
-            return False
+            self.logger.debug("Status check request failed: %s", exc)
+            return None
         except Exception as exc:
-            self.logger.exception("Unexpected error during stream status check: %s", exc)
-            return False
+            self.logger.exception("Unexpected error during status check: %s", exc)
+            return None
 
     async def monitor(self) -> None:
         self.logger.info("Starting ESP32-CAM watcher | ip=%s", self.ip)
         try:
             while not self._stop.is_set():
-                online = await self.check_stream_status()
-
-                # Print status every 2 seconds
-                if online:
-                    print("[OK] Stream Online — %s" % self.ip)
-                    self.logger.info("Stream Online — %s", self.ip)
-                else:
-                    print("[WARN] Stream Offline — Retrying...")
-                    self.logger.warning("Stream Offline — Retrying...")
-
-                # IR-trigger assumption: stream becomes available when IR is active
-                if online and (self._last_online is False or self._last_online is None):
-                    self.logger.info("IR Trigger detected — Opening stream for 10 seconds...")
-                    print("IR Trigger detected — Opening stream for 10 seconds...")
+                # Skip checks if main app has stream active to avoid conflicts
+                if self.main_stream_active is not None and self.main_stream_active.get("value", False):
+                    # Main stream is active, reduce check frequency and don't spam
+                    self.logger.debug("Main stream active - skipping watcher check")
                     try:
-                        await self.open_stream(duration=10)
-                    except Exception as exc:
-                        self.logger.exception("Error while opening/reading stream: %s", exc)
+                        await asyncio.wait_for(self._stop.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                
+                status = await self.check_stream_status()
 
-                self._last_online = online
+                # Print status based on status endpoint
+                if status is not None:
+                    streaming = status.get("streaming", False)
+                    ir_gate = status.get("irGate", False)
+                    awaiting = status.get("awaitingVerification", False)
+                    online = streaming and ir_gate and awaiting
+                    
+                    if online:
+                        print("[OK] Stream Ready — %s" % self.ip)
+                        self.logger.info("Stream Ready — %s", self.ip)
+                    else:
+                        print("[WARN] Stream Not Ready — %s" % self.ip)
+                        self.logger.warning("Stream Not Ready — streaming=%s irGate=%s awaiting=%s", 
+                                          streaming, ir_gate, awaiting)
+                else:
+                    print("[WARN] Status Check Failed — %s" % self.ip)
+                    self.logger.warning("Status Check Failed")
+
+                # Note: We no longer open stream directly - main app handles that based on status
+                current_online = status is not None and status.get("streaming", False) if status else False
+                self._last_online = current_online
+                
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=2.0)
                 except asyncio.TimeoutError:

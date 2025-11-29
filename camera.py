@@ -9,6 +9,7 @@ import logging
 from typing import Optional, Tuple, Union, List
 import os
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -47,19 +48,64 @@ class VideoCapture:
         self._hand_detected_time: Optional[float] = None
         self._snapshot_delay: float = 0.5  # 0.5 seconds delay
         self._snapshot_taken: bool = False
+        # Non-blocking frame reading
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_lock = threading.Lock()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stop_reading = threading.Event()
+        self._frame_available = threading.Event()
 
-    def open(self) -> None:
-        """Open the video source and apply optional resolution settings."""
-        logger.debug("Opening video source: %s", self.source)
-        self._cap = cv2.VideoCapture(self.source)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Failed to open video source: {self.source}")
-
+    def open(self, timeout: float = 2.0) -> bool:
+        """Open the video source and apply optional resolution settings.
+        
+        Args:
+            timeout: Maximum time to wait for connection (seconds)
+            
+        Returns:
+            True if opened successfully, False otherwise
+        """
+        logger.debug("Opening video source: %s (timeout=%s)", self.source, timeout)
+        
+        # Use threading to make open() non-blocking with timeout
+        result = {"success": False, "cap": None, "error": None}
+        
+        def _open_capture():
+            try:
+                cap = cv2.VideoCapture(self.source)
+                if cap.isOpened():
+                    result["cap"] = cap
+                    result["success"] = True
+                else:
+                    result["error"] = "VideoCapture.isOpened() returned False"
+            except Exception as e:
+                result["error"] = str(e)
+        
+        open_thread = threading.Thread(target=_open_capture, daemon=True)
+        open_thread.start()
+        open_thread.join(timeout=timeout)
+        
+        if open_thread.is_alive():
+            # Thread is still running - connection is taking too long
+            logger.debug("Connection timeout after %s seconds", timeout)
+            return False
+        
+        if not result["success"]:
+            logger.debug("Failed to open video source: %s", result.get("error", "Unknown error"))
+            return False
+        
+        self._cap = result["cap"]
+        
         # Apply optional resolution
         if self.width is not None:
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+            try:
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+            except Exception:
+                logger.debug("Failed to set width")
         if self.height is not None:
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+            try:
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+            except Exception:
+                logger.debug("Failed to set height")
 
         # Apply optional buffer size (best-effort; backend-dependent)
         if self.buffer_size is not None:
@@ -67,19 +113,62 @@ class VideoCapture:
                 self._cap.set(cv2.CAP_PROP_BUFFERSIZE, float(self.buffer_size))
             except Exception:
                 logger.debug("CAP_PROP_BUFFERSIZE not supported by backend")
+        
+        # Start background frame reader thread
+        self._stop_reading.clear()
+        self._frame_available.clear()
+        self._reader_thread = threading.Thread(target=self._frame_reader_loop, daemon=True)
+        self._reader_thread.start()
+        logger.debug("Started background frame reader thread")
+        return True
 
+    def _frame_reader_loop(self) -> None:
+        """Background thread that continuously reads frames without blocking."""
+        while not self._stop_reading.is_set():
+            if self._cap is None or not self._cap.isOpened():
+                time.sleep(0.1)  # Wait a bit before retrying
+                continue
+            
+            try:
+                ret, frame = self._cap.read()
+                if ret and frame is not None:
+                    with self._frame_lock:
+                        self._latest_frame = frame.copy()
+                    self._frame_available.set()
+                else:
+                    # Frame read failed, clear latest frame
+                    with self._frame_lock:
+                        self._latest_frame = None
+                    self._frame_available.clear()
+                    time.sleep(0.05)  # Small delay on failure
+            except Exception as exc:
+                logger.debug("Exception in frame reader thread: %s", exc)
+                with self._frame_lock:
+                    self._latest_frame = None
+                self._frame_available.clear()
+                time.sleep(0.1)
+    
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Read a frame from the video source.
+        """Read a frame from the video source (non-blocking).
 
         Returns:
             A tuple of (ret, frame). ret is True if a frame was read successfully.
         """
         if self._cap is None:
             raise RuntimeError("VideoCapture is not opened. Call open() first.")
-        ret, frame = self._cap.read()
-        if not ret:
-            logger.debug("Failed to read frame from source: %s", self.source)
-        return ret, frame
+        
+        # Check if capture is still opened
+        if not self._cap.isOpened():
+            logger.debug("VideoCapture is no longer opened")
+            return False, None
+        
+        # Get the latest frame from the background thread (non-blocking)
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                frame = self._latest_frame.copy()
+                return True, frame
+            else:
+                return False, None
 
     def get_palm_frame(self) -> Tuple[bool, Optional[np.ndarray], List[PalmDetection]]:
         """
@@ -151,6 +240,18 @@ class VideoCapture:
 
     def release(self) -> None:
         """Release the video resource."""
+        # Stop the background reader thread
+        if self._reader_thread is not None:
+            self._stop_reading.set()
+            if self._reader_thread.is_alive():
+                self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
+        
+        # Clear frame data
+        with self._frame_lock:
+            self._latest_frame = None
+        self._frame_available.clear()
+        
         if self._cap is not None:
             logger.debug("Releasing video source: %s", self.source)
             self._cap.release()
