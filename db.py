@@ -11,13 +11,21 @@ from pathlib import Path
 from typing import Any, Optional, Tuple, List
 from contextlib import contextmanager
 
+try:
+    from utils import config
+    DEFAULT_DB_PATH = config.DB_PATH
+except ImportError:
+    DEFAULT_DB_PATH = "palm_auth.db"
+
 logger = logging.getLogger(__name__)
 
 
 class Database:
     """SQLite wrapper with safe connection and transaction handling."""
 
-    def __init__(self, db_path: str | Path = "palm_auth.db") -> None:
+    def __init__(self, db_path: str | Path = None) -> None:
+        if db_path is None:
+            db_path = DEFAULT_DB_PATH
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
 
@@ -139,3 +147,50 @@ def find_user_by_name(name: str) -> Optional[int]:
         cur.execute("SELECT id FROM users WHERE name = ?", (name,))
         row = cur.fetchone()
         return row["id"] if row else None
+
+
+def get_all_users() -> List[Tuple[int, str]]:
+    """Get all users as list of (user_id, name) tuples."""
+    with db.transaction() as cur:
+        cur.execute("SELECT id, name FROM users ORDER BY id")
+        rows = cur.fetchall()
+    return [(row["id"], row["name"]) for row in rows]
+
+
+def delete_user(user_id: int) -> bool:
+    """Delete a user and all their templates. Returns True if successful."""
+    try:
+        with db.transaction() as cur:
+            # Delete templates first (foreign key constraint)
+            cur.execute("DELETE FROM palm_templates WHERE user_id = ?", (user_id,))
+            # Delete user
+            cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error("Failed to delete user %s: %s", user_id, e)
+        return False
+
+
+def get_user_template_count(user_id: int) -> int:
+    """Get the number of templates for a user."""
+    with db.transaction() as cur:
+        cur.execute("SELECT COUNT(*) as count FROM palm_templates WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return row["count"] if row else 0
+
+
+def get_user_templates_info(user_id: int) -> List[Tuple[int, str, str]]:
+    """Get detailed template information for a user.
+    
+    Returns:
+        List of (template_id, handedness, feature_type) tuples
+    """
+    with db.transaction() as cur:
+        cur.execute("""
+            SELECT id, handedness, feature_type 
+            FROM palm_templates 
+            WHERE user_id = ? 
+            ORDER BY id
+        """, (user_id,))
+        rows = cur.fetchall()
+    return [(row["id"], row["handedness"], row["feature_type"]) for row in rows]

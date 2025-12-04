@@ -28,6 +28,8 @@ import math
 import cv2
 import requests
 import numpy as np
+import tkinter as tk
+from tkinter import simpledialog
 
 from utils import config
 
@@ -296,6 +298,25 @@ def send_esp32_signal(unlock: bool, cfg: AppConfig, logger: logging.Logger) -> N
         logger.error(f"Failed to send ESP32 signal: {exc}")
 
 
+def _get_user_name_dialog() -> str:
+    """Show a GUI dialog to get user name for registration."""
+    # Create a hidden root window for the dialog
+    root = tk.Tk()
+    root.withdraw()  # Hide the root window
+    root.attributes('-topmost', True)  # Bring dialog to front
+    
+    # Show the input dialog
+    name = simpledialog.askstring(
+        "Registration Complete",
+        "Enter your name:",
+        parent=root
+    )
+    
+    root.destroy()  # Clean up
+    
+    return name.strip() if name and name.strip() else "Unknown"
+
+
 # Improved fallback palm-facing detection
 def _fallback_is_palm_facing_camera(landmarks: List[Any], handedness: str = "Right") -> bool:
     try:
@@ -358,6 +379,44 @@ def main() -> None:
         except Exception as exc:
             logger.error("Failed to start watcher: %s", exc, exc_info=True)
 
+    # Start lock control web server in background
+    web_server_url: Optional[str] = None
+    try:
+        import threading
+        from lock_control_server import run_lock_control_server
+
+        # Get local network IP for display
+        def _get_local_ip() -> str:
+            """Get the local network IP address."""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+                return local_ip
+            except Exception:
+                return "127.0.0.1"
+
+        local_ip = _get_local_ip()
+        web_server_url = f"http://{local_ip}:5000"
+
+        def _run_web_server() -> None:
+            try:
+                run_lock_control_server(
+                    esp32_ip=device_ip,
+                    host='0.0.0.0',  # Listen on all interfaces for network access
+                    port=5000,
+                    debug=False
+                )
+            except Exception:
+                logging.getLogger("app").exception("Web server thread crashed")
+
+        web_thread = threading.Thread(target=_run_web_server, daemon=True)
+        web_thread.start()
+        logger.info("Lock control web server started | %s", web_server_url)
+    except Exception as exc:
+        logger.error("Failed to start web server: %s", exc, exc_info=True)
+
     # Setup cv2 threading/optimizations
     try:
         cv2.setUseOptimized(True)
@@ -373,77 +432,6 @@ def main() -> None:
 
     # Prepare window immediately so UI shows while waiting for stream
     window_name = config.WINDOW_NAME
-    control_panel_name = "Camera Controls"
-    
-    # Camera settings state
-    camera_settings = {
-        "rotation": 0,  # 0, 90, 180, 270 degrees
-        "brightness": 0,  # -100 to 100
-        "contrast": 0,  # -100 to 100
-        "saturation": 0,  # -100 to 100
-        "hue": 0,  # -180 to 180
-        "flip_horizontal": 0,  # 0 or 1
-        "flip_vertical": 0,  # 0 or 1
-    }
-    
-    def apply_camera_settings(frame: np.ndarray) -> np.ndarray:
-        """Apply camera settings transformations to frame."""
-        if frame is None:
-            return frame
-        result = frame.copy()
-        
-        # Rotation
-        if camera_settings["rotation"] == 90:
-            result = cv2.rotate(result, cv2.ROTATE_90_CLOCKWISE)
-        elif camera_settings["rotation"] == 180:
-            result = cv2.rotate(result, cv2.ROTATE_180)
-        elif camera_settings["rotation"] == 270:
-            result = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        
-        # Flip
-        if camera_settings["flip_horizontal"]:
-            result = cv2.flip(result, 1)
-        if camera_settings["flip_vertical"]:
-            result = cv2.flip(result, 0)
-        
-        # Color adjustments (convert to HSV for hue/saturation, then back)
-        if camera_settings["brightness"] != 0 or camera_settings["contrast"] != 0:
-            alpha = 1.0 + (camera_settings["contrast"] / 100.0)
-            beta = camera_settings["brightness"]
-            result = cv2.convertScaleAbs(result, alpha=alpha, beta=beta)
-        
-        if camera_settings["saturation"] != 0 or camera_settings["hue"] != 0:
-            hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
-            # Adjust saturation
-            if camera_settings["saturation"] != 0:
-                hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + camera_settings["saturation"] / 100.0), 0, 255)
-            # Adjust hue
-            if camera_settings["hue"] != 0:
-                hsv[:, :, 0] = (hsv[:, :, 0] + camera_settings["hue"]) % 180
-            result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        
-        return result
-    
-    def on_rotation_change(val: int) -> None:
-        camera_settings["rotation"] = val * 90
-    
-    def on_brightness_change(val: int) -> None:
-        camera_settings["brightness"] = val - 100
-    
-    def on_contrast_change(val: int) -> None:
-        camera_settings["contrast"] = val - 100
-    
-    def on_saturation_change(val: int) -> None:
-        camera_settings["saturation"] = val - 100
-    
-    def on_hue_change(val: int) -> None:
-        camera_settings["hue"] = val - 180
-    
-    def on_flip_h_change(val: int) -> None:
-        camera_settings["flip_horizontal"] = val
-    
-    def on_flip_v_change(val: int) -> None:
-        camera_settings["flip_vertical"] = val
     
     if app_cfg.display:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -451,19 +439,6 @@ def main() -> None:
             cv2.resizeWindow(window_name, *config.WINDOW_DEFAULT_RESOLUTION)
         except Exception:
             pass
-        
-        # Create control panel window
-        cv2.namedWindow(control_panel_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(control_panel_name, 300, 500)
-        
-        # Create trackbars
-        cv2.createTrackbar("Rotation (0/90/180/270)", control_panel_name, 0, 3, on_rotation_change)
-        cv2.createTrackbar("Brightness", control_panel_name, 100, 200, on_brightness_change)
-        cv2.createTrackbar("Contrast", control_panel_name, 100, 200, on_contrast_change)
-        cv2.createTrackbar("Saturation", control_panel_name, 100, 200, on_saturation_change)
-        cv2.createTrackbar("Hue", control_panel_name, 180, 360, on_hue_change)
-        cv2.createTrackbar("Flip H", control_panel_name, 0, 1, on_flip_h_change)
-        cv2.createTrackbar("Flip V", control_panel_name, 0, 1, on_flip_v_change)
 
     def show_placeholder(message: str, wait_ms: int = 100) -> int:
         """Render a placeholder frame with status + stream IP."""
@@ -475,6 +450,9 @@ def main() -> None:
             cv2.putText(placeholder, message, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             ip_label = f"Stream: {device_ip}"
             cv2.putText(placeholder, ip_label, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
+            if web_server_url:
+                web_label = f"Lock Control: {web_server_url}"
+                cv2.putText(placeholder, web_label, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2)
             cv2.imshow(window_name, placeholder)
             return cv2.waitKey(wait_ms) & 0xFF
         except Exception:
@@ -811,11 +789,6 @@ def main() -> None:
                     time.sleep(0.1)
                 continue
             
-            # Apply camera settings transformations
-            try:
-                annotated = apply_camera_settings(annotated)
-            except Exception as exc:
-                logger.debug("Failed to apply camera settings: %s", exc)
 
             # If in cooldown, skip verification processing but still display/capture frames
             if verification_cooldown is not None and now < verification_cooldown:
@@ -866,7 +839,7 @@ def main() -> None:
                         
                         if len(registration_detections) >= registration_targets:
                             try:
-                                user_name = input("\nRegistration complete! Enter your name: ").strip() or "Unknown"
+                                user_name = _get_user_name_dialog()
                                 success_reg, user_id = registrar.register_user_with_features(
                                     registration_detections,
                                     handedness=registration_handedness or "Right",
@@ -993,6 +966,10 @@ def main() -> None:
                     ip_label = f"Stream: {device_ip}"
                     cv2.putText(annotated, ip_label, (8, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                 (180, 255, 180), 1)
+                    if web_server_url:
+                        web_label = f"Lock Control: {web_server_url}"
+                        cv2.putText(annotated, web_label, (8, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    (180, 180, 255), 1)
                 except Exception:
                     logger.debug("Failed to draw status text", exc_info=True)
                 cv2.imshow(window_name, annotated)
